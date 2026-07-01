@@ -380,6 +380,57 @@ async def resend_otp(body: dict):
     send_otp_email(u["email"], code)
     return {"message": "Resent", "demo_otp": code if DEMO_MODE else None}
 
+
+# ── Forgot Password ──────────────────────────────────────────
+class ForgotPasswordInitIn(BaseModel):
+    identifier: str  # email or phone
+
+class ForgotPasswordVerifyIn(BaseModel):
+    identifier: str; otp: str
+
+class ForgotPasswordResetIn(BaseModel):
+    identifier: str; otp: str; new_password: str
+
+@api.post("/auth/forgot-password-init")
+async def forgot_password_init(p: ForgotPasswordInitIn):
+    identifier = p.identifier.strip()
+    user = await db.users.find_one({"$or": [{"email": identifier}, {"phone": identifier}]})
+    if not user or not user.get("is_verified"):
+        raise HTTPException(400, "No account found with this email or phone number")
+    code = f"{random.randint(0,9999):04d}"
+    await db.reset_otps.update_one(
+        {"identifier": identifier},
+        {"$set": {"identifier": identifier, "user_id": user["id"], "otp_hash": hashpw(code),
+                  "otp_expires_at": now() + timedelta(minutes=10), "verified": False}},
+        upsert=True
+    )
+    is_email = "@" in identifier
+    if is_email:
+        send_otp_email(identifier, code)
+    else:
+        send_otp_sms(identifier, code)
+    return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email" if is_email else "sms"}
+
+@api.post("/auth/forgot-password-verify")
+async def forgot_password_verify(p: ForgotPasswordVerifyIn):
+    rec = await db.reset_otps.find_one({"identifier": p.identifier.strip()})
+    if not rec: raise HTTPException(400, "Request not found. Please start again.")
+    exp = rec["otp_expires_at"]
+    if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+    if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
+    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    await db.reset_otps.update_one({"identifier": p.identifier.strip()}, {"$set": {"verified": True}})
+    return {"message": "OTP verified"}
+
+@api.post("/auth/forgot-password-reset")
+async def forgot_password_reset(p: ForgotPasswordResetIn):
+    rec = await db.reset_otps.find_one({"identifier": p.identifier.strip(), "verified": True})
+    if not rec: raise HTTPException(400, "Not verified. Please verify OTP first.")
+    if len(p.new_password) < 6: raise HTTPException(400, "Password must be at least 6 characters")
+    await db.users.update_one({"id": rec["user_id"]}, {"$set": {"password_hash": hashpw(p.new_password)}})
+    await db.reset_otps.delete_one({"identifier": p.identifier.strip()})
+    return {"message": "Password reset successfully! Please log in."}
+
 # ── Auth Email (OTP-first) ──────────────────────────────────────
 @api.post("/auth/email-signup-init")
 async def email_signup_init(p: EmailInitIn):
