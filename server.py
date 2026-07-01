@@ -995,6 +995,26 @@ async def list_friends(u=Depends(current_user)):
         {"id": {"$in": friend_ids}}, 
         {"_id": 0, "password_hash": 0, "otp_hash": 0}
     ).to_list(500)
+
+    # Populate user info for pending incoming requests
+    in_from_ids = [r["from_id"] for r in pending_in]
+    out_to_ids  = [r["to_id"]   for r in pending_out]
+
+    in_users_list = await db.users.find(
+        {"id": {"$in": in_from_ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}
+    ).to_list(500) if in_from_ids else []
+    out_users_list = await db.users.find(
+        {"id": {"$in": out_to_ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}
+    ).to_list(500) if out_to_ids else []
+
+    in_users  = {usr["id"]: usr for usr in in_users_list}
+    out_users = {usr["id"]: usr for usr in out_users_list}
+
+    for r in pending_in:
+        r["from_user"] = in_users.get(r["from_id"], {})
+    for r in pending_out:
+        r["to_user"] = out_users.get(r["to_id"], {})
+
     return {"friends": friends, "pending_incoming": pending_in, "pending_outgoing": pending_out}
 
 # ── Messages ─────────────────────────────────────────────────
