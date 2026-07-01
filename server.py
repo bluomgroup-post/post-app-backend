@@ -305,7 +305,7 @@ async def signup(p: SignupIn):
     
     code = f"{random.randint(0,9999):04d}"
     uid = existing["id"] if existing else str(uuid.uuid4())
-    colors = ["#FFD600","#00C853","#FF1744","#2979FF"]
+    colors = ["#FFD600","#00C853","#FF1744","#29B6F6"]
     doc = {
         "id": uid, "email": p.email, "name": p.name, "username": p.username,
         "handle": f"@{p.username}",
@@ -402,7 +402,7 @@ async def email_signup(p: EmailSignupIn):
     except ValueError as e:
         raise HTTPException(400, str(e))
     
-    colors = ["#FFD600","#00C853","#FF1744","#2979FF"]
+    colors = ["#FFD600","#00C853","#FF1744","#29B6F6"]
     uid = str(uuid.uuid4())
     doc = {
         "id": uid, "email": p.email, "name": p.name, "username": p.username,
@@ -458,7 +458,7 @@ async def phone_signup(p: PhoneSignupIn):
     except ValueError as e:
         raise HTTPException(400, str(e))
     
-    colors = ["#FFD600","#00C853","#FF1744","#2979FF"]
+    colors = ["#FFD600","#00C853","#FF1744","#29B6F6"]
     uid = str(uuid.uuid4())
     doc = {
         "id": uid, "phone": p.phone, "email": f"{p.phone.replace('+','')}@phone.post",
@@ -974,15 +974,15 @@ async def seed():
     WORLD = [
         ("Aryan","@aryan_world","Mumbai, India","Photographer & traveller 📷","Asia","#FFD600"),
         ("Bella","@bella_creates","London, UK","Designer. Coffee lover ☕","Europe","#00C853"),
-        ("Carlos","@carlos_global","Mexico City","Entrepreneur 🚀","Americas","#2979FF"),
+        ("Carlos","@carlos_global","Mexico City","Entrepreneur 🚀","Americas","#29B6F6"),
         ("Yuki","@yuki_jp","Tokyo, Japan","Manga artist 🎨","Asia","#00C853"),
         ("Fatima","@fatima_sa","Riyadh, Saudi Arabia","Writer & poet ✍️","Asia","#FF1744"),
         ("Pierre","@pierre_fr","Paris, France","Chef & food blogger 🥐","Europe","#FF1744"),
         ("Lucas","@lucas_br","São Paulo, Brazil","Carnaval organizer 🎉","Americas","#00C853"),
-        ("Chioma","@chioma_ng","Lagos, Nigeria","Fashion designer 👗","Africa","#2979FF"),
+        ("Chioma","@chioma_ng","Lagos, Nigeria","Fashion designer 👗","Africa","#29B6F6"),
         ("Jack","@jack_au","Sydney, Australia","Surfer & barista ☕","Oceania","#00C853"),
         ("Soo-Jin","@soojin_kr","Seoul, South Korea","K-pop enthusiast 🎵","Asia","#FF1744"),
-        ("Anna","@anna_se","Stockholm, Sweden","Environmentalist 🌿","Europe","#2979FF"),
+        ("Anna","@anna_se","Stockholm, Sweden","Environmentalist 🌿","Europe","#29B6F6"),
         ("Amara","@amara_ke","Nairobi, Kenya","Safari guide 🦁","Africa","#FFD600"),
     ]
     for name, handle, loc, about, continent, color in WORLD:
