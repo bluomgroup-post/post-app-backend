@@ -1,12 +1,13 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
-import os, uuid, random, logging, bcrypt, jwt, re
+import os, uuid, random, logging, bcrypt, jwt, re, io
 from pydantic import BaseModel, EmailStr, field_validator
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timezone, timedelta
+import base64
 
 load_dotenv()
 
@@ -58,7 +59,6 @@ def send_otp_email(email, code):
         import resend
         resend.api_key = RESEND_API_KEY
         
-        # ✨ FIXED: Complete HTML template with proper structure
         html_body = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -109,9 +109,9 @@ def send_otp_email(email, code):
         resend.Emails.send({
             "from": "POST App <noreply@postbluom.online>",
             "to": [email],
-            "subject": f"[POST] Verification Code: {code}",  # ✨ Clearer subject
+            "subject": f"[POST] Verification Code: {code}",
             "html": html_body,
-            "reply_to": "support@postbluom.online",  # ✨ Added reply-to
+            "reply_to": "support@postbluom.online",
         })
         logging.info(f"✅ OTP email sent to {email}")
     except Exception as e:
@@ -136,8 +136,15 @@ def send_otp_sms(phone, code):
         return False
 
 async def ensure_username_unique(username: str, exclude_uid: Optional[str] = None):
-    """Disabled: usernames no longer need to be unique."""
-    return
+    """Usernames must be unique"""
+    count = await db.users.count_documents({"username": username})
+    if count > 0:
+        if exclude_uid:
+            user = await db.users.find_one({"username": username})
+            if user["id"] != exclude_uid:
+                raise ValueError("Username already taken")
+        else:
+            raise ValueError("Username already taken")
 
 # ── Models ───────────────────────────────────────────────────
 class SignupIn(BaseModel):
@@ -217,12 +224,23 @@ class ProfileUpdate(BaseModel):
 class PostIn(BaseModel):
     content: str; accent: str = "#FFD600"; location: Optional[str] = None
 
-class CommentIn(BaseModel): text: str
-class LikeIn(BaseModel): color: Optional[str] = None
+class CommentIn(BaseModel): 
+    text: str
+
+class LikeIn(BaseModel): 
+    color: Optional[str] = None
+
 class MessageIn(BaseModel):
     to_user_id: str; text: str
+
 class FriendIn(BaseModel):
     target_user_id: str
+
+class NotificationPrefs(BaseModel):
+    likes: bool = True
+    comments: bool = True
+    friend_requests: bool = True
+    messages: bool = True
 
 # ── Auth Email ───────────────────────────────────────────────
 @api.post("/auth/signup")
@@ -230,7 +248,12 @@ async def signup(p: SignupIn):
     existing = await db.users.find_one({"email": p.email})
     if existing and existing.get("is_verified"):
         raise HTTPException(400, "Email already registered")
-    await ensure_username_unique(p.username, exclude_uid=existing["id"] if existing else None)
+    
+    try:
+        await ensure_username_unique(p.username, exclude_uid=existing["id"] if existing else None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    
     code = f"{random.randint(0,9999):04d}"
     uid = existing["id"] if existing else str(uuid.uuid4())
     colors = ["#FFD600","#00C853","#FF1744","#2979FF"]
@@ -242,6 +265,9 @@ async def signup(p: SignupIn):
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False,
+        "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
+            "likes": True, "comments": True, "friend_requests": True, "messages": True
+        }
     }
     if existing:
         await db.users.update_one({"id": uid}, {"$set": doc})
@@ -278,7 +304,7 @@ async def resend_otp(body: dict):
     send_otp_email(u["email"], code)
     return {"message": "Resent", "demo_otp": code if DEMO_MODE else None}
 
-# ── Auth Email (OTP-first, phone jaisa flow) ──────────────────
+# ── Auth Email (OTP-first) ──────────────────────────────────────
 @api.post("/auth/email-signup-init")
 async def email_signup_init(p: EmailInitIn):
     existing = await db.users.find_one({"email": p.email, "is_verified": True})
@@ -295,21 +321,26 @@ async def email_signup_init(p: EmailInitIn):
 @api.post("/auth/email-verify-init")
 async def email_verify_init(p: EmailVerifyIn):
     rec = await db.email_otps.find_one({"email": p.email})
-    if not rec: raise HTTPException(400, "Email not found — pehle OTP bhejo")
+    if not rec: raise HTTPException(400, "Email not found")
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
-    if now() > exp: raise HTTPException(400, "OTP expire ho gaya")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Galat OTP")
+    if now() > exp: raise HTTPException(400, "OTP expired")
+    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.email_otps.update_one({"email": p.email}, {"$set": {"verified": True}})
     return {"message": "Email verified"}
 
 @api.post("/auth/email-signup")
 async def email_signup(p: EmailSignupIn):
     rec = await db.email_otps.find_one({"email": p.email, "verified": True})
-    if not rec: raise HTTPException(400, "Email verified nahi hai")
+    if not rec: raise HTTPException(400, "Email not verified")
     existing = await db.users.find_one({"email": p.email, "is_verified": True})
     if existing: raise HTTPException(400, "Email already registered")
-    await ensure_username_unique(p.username)
+    
+    try:
+        await ensure_username_unique(p.username)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    
     colors = ["#FFD600","#00C853","#FF1744","#2979FF"]
     uid = str(uuid.uuid4())
     doc = {
@@ -319,12 +350,15 @@ async def email_signup(p: EmailSignupIn):
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False,
+        "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
+            "likes": True, "comments": True, "friend_requests": True, "messages": True
+        }
     }
     await db.users.insert_one(doc)
     await db.email_otps.delete_one({"email": p.email})
     return {"token": make_token(uid), "user_id": uid}
 
-# ── Auth Phone (Twilio) ──────────────────────────────────────
+# ── Auth Phone ──────────────────────────────────────────────
 @api.post("/auth/phone-signup-init")
 async def phone_signup_init(p: PhoneInitIn):
     code = f"{random.randint(0,9999):04d}"
@@ -339,21 +373,26 @@ async def phone_signup_init(p: PhoneInitIn):
 @api.post("/auth/phone-verify-init")
 async def phone_verify_init(p: PhoneVerifyIn):
     rec = await db.phone_otps.find_one({"phone": p.phone})
-    if not rec: raise HTTPException(400, "Phone not found — pehle OTP bhejo")
+    if not rec: raise HTTPException(400, "Phone not found")
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
-    if now() > exp: raise HTTPException(400, "OTP expire ho gaya")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Galat OTP")
+    if now() > exp: raise HTTPException(400, "OTP expired")
+    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"verified": True}})
     return {"message": "Phone verified"}
 
 @api.post("/auth/phone-signup")
 async def phone_signup(p: PhoneSignupIn):
     rec = await db.phone_otps.find_one({"phone": p.phone, "verified": True})
-    if not rec: raise HTTPException(400, "Phone verified nahi hai")
+    if not rec: raise HTTPException(400, "Phone not verified")
     existing = await db.users.find_one({"phone": p.phone, "is_verified": True})
     if existing: raise HTTPException(400, "Phone already registered")
-    await ensure_username_unique(p.username)
+    
+    try:
+        await ensure_username_unique(p.username)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    
     colors = ["#FFD600","#00C853","#FF1744","#2979FF"]
     uid = str(uuid.uuid4())
     doc = {
@@ -363,6 +402,9 @@ async def phone_signup(p: PhoneSignupIn):
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False,
+        "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
+            "likes": True, "comments": True, "friend_requests": True, "messages": True
+        }
     }
     await db.users.insert_one(doc)
     await db.phone_otps.delete_one({"phone": p.phone})
@@ -371,8 +413,8 @@ async def phone_signup(p: PhoneSignupIn):
 @api.post("/auth/phone-login")
 async def phone_login(p: PhoneLoginIn):
     u = await db.users.find_one({"phone": p.phone})
-    if not u or not verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Galat phone ya password")
-    if not u.get("is_verified"): raise HTTPException(400, "Account verified nahi")
+    if not u or not verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid phone or password")
+    if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
     return {"token": make_token(u["id"]), "user_id": u["id"]}
 
 @api.get("/auth/me")
@@ -383,7 +425,10 @@ async def me(u=Depends(current_user)): return u
 async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
     upd = {k: v for k,v in p.dict().items() if v is not None}
     if "username" in upd:
-        await ensure_username_unique(upd["username"], exclude_uid=u["id"])
+        try:
+            await ensure_username_unique(upd["username"], exclude_uid=u["id"])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         upd["handle"] = f"@{upd['username']}"
     if upd:
         await db.users.update_one({"id": u["id"]}, {"$set": upd})
@@ -399,13 +444,38 @@ async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
 
 # ── Users ────────────────────────────────────────────────────
 @api.get("/users")
-async def list_users(continent: Optional[str] = None, q: Optional[str] = None, u=Depends(current_user)):
+async def list_users(continent: Optional[str] = None, q: Optional[str] = None, skip: int = 0, limit: int = 50, u=Depends(current_user)):
     query = {"id": {"$ne": u["id"]}, "is_verified": True}
     if continent and continent != "All": query["continent"] = continent
     if q:
-        query["$or"] = [{"name": {"$regex": q, "$options": "i"}}, {"handle": {"$regex": q, "$options": "i"}}, {"username": {"$regex": q, "$options": "i"}}, {"location": {"$regex": q, "$options": "i"}}]
-    users = await db.users.find(query, {"_id": 0, "password_hash": 0, "otp_hash": 0}).limit(200).to_list(200)
-    return users
+        query["$or"] = [
+            {"name": {"$regex": q, "$options": "i"}}, 
+            {"handle": {"$regex": q, "$options": "i"}}, 
+            {"username": {"$regex": q, "$options": "i"}}, 
+            {"location": {"$regex": q, "$options": "i"}}
+        ]
+    users = await db.users.find(query, {"_id": 0, "password_hash": 0, "otp_hash": 0}).skip(skip).limit(limit).to_list(limit)
+    total = await db.users.count_documents(query)
+    return {"users": users, "total": total, "skip": skip, "limit": limit}
+
+@api.get("/users/{user_id}")
+async def get_user(user_id: str, u=Depends(current_user)):
+    """Get user profile with stats"""
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+    if not user: raise HTTPException(404, "User not found")
+    
+    posts_count = await db.posts.count_documents({"user_id": user_id})
+    followers_count = len(user.get("followers", []))
+    following_count = len(user.get("following", []))
+    
+    return {
+        **user,
+        "stats": {
+            "posts": posts_count,
+            "followers": followers_count,
+            "following": following_count
+        }
+    }
 
 # ── Posts ────────────────────────────────────────────────────
 @api.post("/posts")
@@ -415,19 +485,44 @@ async def create_post(p: PostIn, u=Depends(current_user)):
         "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
         "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
         "content": p.content, "accent": p.accent, "location": p.location or "",
-        "likes": [], "comments": [], "created_at": now().isoformat()
+        "likes": [], "comments": [], "views": [], "created_at": now().isoformat(),
+        "edited_at": None, "is_pinned": False
     }
     await db.posts.insert_one(doc.copy())
     doc.pop("_id", None)
     return doc
 
 @api.get("/posts")
-async def list_posts(q: Optional[str] = None, u=Depends(current_user)):
+async def list_posts(q: Optional[str] = None, skip: int = 0, limit: int = 50, u=Depends(current_user)):
     query = {}
     if q:
-        query["$or"] = [{"content": {"$regex": q, "$options": "i"}}, {"user_name": {"$regex": q, "$options": "i"}}, {"location": {"$regex": q, "$options": "i"}}]
-    posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
-    return posts
+        query["$or"] = [
+            {"content": {"$regex": q, "$options": "i"}}, 
+            {"user_name": {"$regex": q, "$options": "i"}}, 
+            {"location": {"$regex": q, "$options": "i"}}
+        ]
+    posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    total = await db.posts.count_documents(query)
+    
+    # Add view tracking
+    for post in posts:
+        if u["id"] not in post.get("views", []):
+            await db.posts.update_one({"id": post["id"]}, {"$push": {"views": u["id"]}})
+    
+    return {"posts": posts, "total": total, "skip": skip, "limit": limit}
+
+@api.get("/posts/{pid}")
+async def get_post(pid: str, u=Depends(current_user)):
+    """Get single post with details"""
+    post = await db.posts.find_one({"id": pid})
+    if not post: raise HTTPException(404, "Post not found")
+    
+    # Track view
+    if u["id"] not in post.get("views", []):
+        await db.posts.update_one({"id": pid}, {"$push": {"views": u["id"]}})
+        post["views"] = post.get("views", []) + [u["id"]]
+    
+    return post
 
 @api.delete("/posts/{pid}")
 async def delete_post(pid: str, u=Depends(current_user)):
@@ -437,20 +532,148 @@ async def delete_post(pid: str, u=Depends(current_user)):
     await db.posts.delete_one({"id": pid})
     return {"ok": True}
 
+@api.patch("/posts/{pid}")
+async def edit_post(pid: str, p: PostIn, u=Depends(current_user)):
+    """Edit post content"""
+    post = await db.posts.find_one({"id": pid})
+    if not post: raise HTTPException(404, "Post not found")
+    if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
+    
+    await db.posts.update_one({"id": pid}, {"$set": {
+        "content": p.content,
+        "accent": p.accent,
+        "location": p.location or "",
+        "edited_at": now().isoformat()
+    }})
+    return await db.posts.find_one({"id": pid})
+
 @api.post("/posts/{pid}/like")
 async def like_post(pid: str, p: LikeIn, u=Depends(current_user)):
     post = await db.posts.find_one({"id": pid})
     if not post: raise HTTPException(404, "Not found")
     likes = [l for l in post.get("likes", []) if l["user_id"] != u["id"]]
-    if p.color: likes.append({"user_id": u["id"], "color": p.color})
+    if p.color: likes.append({"user_id": u["id"], "color": p.color, "liked_at": now().isoformat()})
     await db.posts.update_one({"id": pid}, {"$set": {"likes": likes}})
-    return {"likes": likes}
+    
+    # Create notification
+    if p.color and post["user_id"] != u["id"]:
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": post["user_id"],
+            "from_user_id": u["id"],
+            "from_user_name": u["name"],
+            "type": "like",
+            "post_id": pid,
+            "created_at": now().isoformat(),
+            "read": False
+        })
+    
+    return {"likes": likes, "total": len(likes)}
 
 @api.post("/posts/{pid}/comments")
 async def add_comment(pid: str, p: CommentIn, u=Depends(current_user)):
-    c = {"id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"], "text": p.text, "created_at": now().isoformat()}
+    post = await db.posts.find_one({"id": pid})
+    if not post: raise HTTPException(404, "Post not found")
+    
+    c = {
+        "id": str(uuid.uuid4()), 
+        "user_id": u["id"], 
+        "user_name": u["name"], 
+        "user_handle": u["handle"],
+        "avatar_bg": u["avatar_bg"],
+        "avatar_letter": u["avatar_letter"],
+        "text": p.text, 
+        "created_at": now().isoformat()
+    }
     await db.posts.update_one({"id": pid}, {"$push": {"comments": c}})
+    
+    # Create notification
+    if post["user_id"] != u["id"]:
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": post["user_id"],
+            "from_user_id": u["id"],
+            "from_user_name": u["name"],
+            "type": "comment",
+            "post_id": pid,
+            "created_at": now().isoformat(),
+            "read": False
+        })
+    
     return c
+
+@api.delete("/posts/{pid}/comments/{cid}")
+async def delete_comment(pid: str, cid: str, u=Depends(current_user)):
+    """Delete comment"""
+    post = await db.posts.find_one({"id": pid})
+    if not post: raise HTTPException(404, "Post not found")
+    
+    comment = next((c for c in post.get("comments", []) if c["id"] == cid), None)
+    if not comment: raise HTTPException(404, "Comment not found")
+    if comment["user_id"] != u["id"] and post["user_id"] != u["id"]: 
+        raise HTTPException(403, "Cannot delete")
+    
+    await db.posts.update_one({"id": pid}, {"$pull": {"comments": {"id": cid}}})
+    return {"ok": True}
+
+# ── Followers/Following ──────────────────────────────────────
+@api.post("/users/{user_id}/follow")
+async def follow_user(user_id: str, u=Depends(current_user)):
+    """Follow a user"""
+    if user_id == u["id"]: raise HTTPException(400, "Can't follow yourself")
+    
+    target = await db.users.find_one({"id": user_id})
+    if not target: raise HTTPException(404, "User not found")
+    
+    # Add to following
+    if u["id"] not in target.get("followers", []):
+        await db.users.update_one({"id": user_id}, {"$push": {"followers": u["id"]}})
+    if user_id not in u.get("following", []):
+        await db.users.update_one({"id": u["id"]}, {"$push": {"following": user_id}})
+    
+    # Create notification
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "from_user_id": u["id"],
+        "from_user_name": u["name"],
+        "type": "follow",
+        "created_at": now().isoformat(),
+        "read": False
+    })
+    
+    return {"ok": True}
+
+@api.post("/users/{user_id}/unfollow")
+async def unfollow_user(user_id: str, u=Depends(current_user)):
+    """Unfollow a user"""
+    await db.users.update_one({"id": user_id}, {"$pull": {"followers": u["id"]}})
+    await db.users.update_one({"id": u["id"]}, {"$pull": {"following": user_id}})
+    return {"ok": True}
+
+@api.get("/users/{user_id}/followers")
+async def get_followers(user_id: str, u=Depends(current_user)):
+    """Get user followers"""
+    user = await db.users.find_one({"id": user_id})
+    if not user: raise HTTPException(404, "User not found")
+    
+    followers = await db.users.find(
+        {"id": {"$in": user.get("followers", [])}},
+        {"_id": 0, "password_hash": 0, "otp_hash": 0}
+    ).to_list(500)
+    return followers
+
+@api.get("/users/{user_id}/following")
+async def get_following(user_id: str, u=Depends(current_user)):
+    """Get users being followed"""
+    user = await db.users.find_one({"id": user_id})
+    if not user: raise HTTPException(404, "User not found")
+    
+    following = await db.users.find(
+        {"id": {"$in": user.get("following", [])}},
+        {"_id": 0, "password_hash": 0, "otp_hash": 0}
+    ).to_list(500)
+    return following
 
 # ── Friends ──────────────────────────────────────────────────
 @api.post("/friends/request")
@@ -458,12 +681,33 @@ async def friend_request(p: FriendIn, u=Depends(current_user)):
     if p.target_user_id == u["id"]: raise HTTPException(400, "Can't friend yourself")
     existing = await db.friend_requests.find_one({"from_id": u["id"], "to_id": p.target_user_id})
     if existing: return {"status": existing["status"]}
-    await db.friend_requests.insert_one({"id": str(uuid.uuid4()), "from_id": u["id"], "to_id": p.target_user_id, "status": "pending", "created_at": now().isoformat()})
+    await db.friend_requests.insert_one({
+        "id": str(uuid.uuid4()), 
+        "from_id": u["id"], 
+        "to_id": p.target_user_id, 
+        "status": "pending", 
+        "created_at": now().isoformat()
+    })
+    
+    # Create notification
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": p.target_user_id,
+        "from_user_id": u["id"],
+        "from_user_name": u["name"],
+        "type": "friend_request",
+        "created_at": now().isoformat(),
+        "read": False
+    })
+    
     return {"status": "pending"}
 
 @api.post("/friends/accept")
 async def friend_accept(p: FriendIn, u=Depends(current_user)):
-    await db.friend_requests.update_one({"from_id": p.target_user_id, "to_id": u["id"], "status": "pending"}, {"$set": {"status": "accepted"}})
+    await db.friend_requests.update_one(
+        {"from_id": p.target_user_id, "to_id": u["id"], "status": "pending"}, 
+        {"$set": {"status": "accepted"}}
+    )
     return {"ok": True}
 
 @api.post("/friends/decline")
@@ -478,33 +722,107 @@ async def friend_cancel(p: FriendIn, u=Depends(current_user)):
 
 @api.get("/friends")
 async def list_friends(u=Depends(current_user)):
-    accepted = await db.friend_requests.find({"$or": [{"from_id": u["id"], "status": "accepted"}, {"to_id": u["id"], "status": "accepted"}]}, {"_id": 0}).to_list(500)
+    accepted = await db.friend_requests.find(
+        {"$or": [{"from_id": u["id"], "status": "accepted"}, {"to_id": u["id"], "status": "accepted"}]}, 
+        {"_id": 0}
+    ).to_list(500)
     friend_ids = [r["to_id"] if r["from_id"] == u["id"] else r["from_id"] for r in accepted]
     pending_in = await db.friend_requests.find({"to_id": u["id"], "status": "pending"}, {"_id": 0}).to_list(500)
     pending_out = await db.friend_requests.find({"from_id": u["id"], "status": "pending"}, {"_id": 0}).to_list(500)
-    friends = await db.users.find({"id": {"$in": friend_ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}).to_list(500)
+    friends = await db.users.find(
+        {"id": {"$in": friend_ids}}, 
+        {"_id": 0, "password_hash": 0, "otp_hash": 0}
+    ).to_list(500)
     return {"friends": friends, "pending_incoming": pending_in, "pending_outgoing": pending_out}
 
 # ── Messages ─────────────────────────────────────────────────
 @api.post("/messages")
 async def send_message(p: MessageIn, u=Depends(current_user)):
-    m = {"id": str(uuid.uuid4()), "from_id": u["id"], "from_name": u["name"], "to_id": p.to_user_id, "text": p.text, "created_at": now().isoformat()}
+    m = {
+        "id": str(uuid.uuid4()), 
+        "from_id": u["id"], 
+        "from_name": u["name"], 
+        "to_id": p.to_user_id, 
+        "text": p.text, 
+        "created_at": now().isoformat(),
+        "read": False
+    }
     await db.messages.insert_one(m.copy())
     m.pop("_id", None)
     return m
 
 @api.get("/messages")
-async def list_messages(with_user: Optional[str] = None, u=Depends(current_user)):
+async def list_messages(with_user: Optional[str] = None, skip: int = 0, limit: int = 50, u=Depends(current_user)):
     if with_user:
         q = {"$or": [{"from_id": u["id"], "to_id": with_user}, {"from_id": with_user, "to_id": u["id"]}]}
     else:
         q = {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]}
-    msgs = await db.messages.find(q, {"_id": 0}).sort("created_at", 1).limit(500).to_list(500)
-    return msgs
+    
+    msgs = await db.messages.find(q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    total = await db.messages.count_documents(q)
+    
+    # Mark as read
+    if with_user:
+        await db.messages.update_many(
+            {"from_id": with_user, "to_id": u["id"], "read": False},
+            {"$set": {"read": True}}
+        )
+    
+    return {"messages": msgs, "total": total, "skip": skip, "limit": limit}
+
+# ── Notifications ────────────────────────────────────────────
+@api.get("/notifications")
+async def get_notifications(u=Depends(current_user)):
+    """Get user notifications"""
+    notifs = await db.notifications.find(
+        {"user_id": u["id"]}, 
+        {"_id": 0}
+    ).sort("created_at", -1).limit(100).to_list(100)
+    
+    unread_count = await db.notifications.count_documents({"user_id": u["id"], "read": False})
+    return {"notifications": notifs, "unread_count": unread_count}
+
+@api.post("/notifications/{notif_id}/read")
+async def mark_notification_read(notif_id: str, u=Depends(current_user)):
+    """Mark notification as read"""
+    await db.notifications.update_one(
+        {"id": notif_id, "user_id": u["id"]},
+        {"$set": {"read": True}}
+    )
+    return {"ok": True}
+
+@api.post("/notifications/read-all")
+async def mark_all_notifications_read(u=Depends(current_user)):
+    """Mark all notifications as read"""
+    await db.notifications.update_many(
+        {"user_id": u["id"], "read": False},
+        {"$set": {"read": True}}
+    )
+    return {"ok": True}
+
+# ── Block Users ──────────────────────────────────────────────
+@api.post("/users/{user_id}/block")
+async def block_user(user_id: str, u=Depends(current_user)):
+    """Block a user"""
+    if user_id == u["id"]: raise HTTPException(400, "Can't block yourself")
+    await db.users.update_one({"id": u["id"]}, {"$addToSet": {"blocked_users": user_id}})
+    return {"ok": True}
+
+@api.post("/users/{user_id}/unblock")
+async def unblock_user(user_id: str, u=Depends(current_user)):
+    """Unblock a user"""
+    await db.users.update_one({"id": u["id"]}, {"$pull": {"blocked_users": user_id}})
+    return {"ok": True}
 
 # ── Health ───────────────────────────────────────────────────
 @api.get("/")
-async def root(): return {"status": "ok", "demo_mode": DEMO_MODE, "twilio": bool(TWILIO_SID)}
+async def root(): 
+    return {
+        "status": "ok", 
+        "demo_mode": DEMO_MODE, 
+        "twilio": bool(TWILIO_SID),
+        "version": "2.0"
+    }
 
 # ── Seed ─────────────────────────────────────────────────────
 @app.on_event("startup")
@@ -526,7 +844,30 @@ async def seed():
     ]
     for name, handle, loc, about, continent, color in WORLD:
         uid = str(uuid.uuid4())
-        await db.users.insert_one({"id": uid, "email": f"{handle[1:]}@post.demo", "username": handle[1:], "name": name, "handle": handle, "is_verified": True, "is_seed": True, "avatar_bg": color, "avatar_letter": name[0], "avatar_photo": None, "location": loc, "about": about, "language": "en", "continent": continent, "created_at": now()})
+        await db.users.insert_one({
+            "id": uid, 
+            "email": f"{handle[1:]}@post.demo", 
+            "username": handle[1:], 
+            "name": name, 
+            "handle": handle, 
+            "is_verified": True, 
+            "is_seed": True, 
+            "avatar_bg": color,
+            "avatar_letter": name[0], 
+            "location": loc, 
+            "about": about, 
+            "continent": continent,
+            "created_at": now(),
+            "followers": [],
+            "following": [],
+            "blocked_users": [],
+            "notifications_prefs": {
+                "likes": True,
+                "comments": True,
+                "friend_requests": True,
+                "messages": True
+            }
+        })
     logging.info("✅ World users seeded")
 
 app.include_router(api)
