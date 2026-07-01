@@ -46,7 +46,8 @@ def make_token(uid):
 
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
 
-async def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
+async def raw_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
+    """Get user from token without secondary contact check (for add-phone/add-email flows)."""
     if not creds: raise HTTPException(401, "Missing token")
     try:
         payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
@@ -54,6 +55,14 @@ async def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
     except: raise HTTPException(401, "Invalid token")
     u = await db.users.find_one({"id": uid}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
     if not u: raise HTTPException(401, "User not found")
+    return u
+
+async def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
+    u = await raw_user(creds)
+    if u.get("signup_method") == "email" and not u.get("phone_verified", True):
+        raise HTTPException(403, detail={"code": "SECONDARY_REQUIRED", "type": "phone"})
+    if u.get("signup_method") == "phone" and not u.get("email_verified", True):
+        raise HTTPException(403, detail={"code": "SECONDARY_REQUIRED", "type": "email"})
     return u
 
 def send_otp_email(email, code):
@@ -278,6 +287,18 @@ class ProfileUpdate(BaseModel):
     website: Optional[str] = None
     avatar_bg: Optional[str] = None
     avatar_letter: Optional[str] = None
+
+class AddPhoneInitIn(BaseModel):
+    phone: str
+
+class AddPhoneVerifyIn(BaseModel):
+    phone: str; otp: str
+
+class AddEmailInitIn(BaseModel):
+    email: EmailStr
+
+class AddEmailVerifyIn(BaseModel):
+    email: EmailStr; otp: str
     avatar_photo: Optional[str] = None
     profile_video: Optional[str] = None
     cover_photo: Optional[str] = None
@@ -500,6 +521,7 @@ async def email_signup(p: EmailSignupIn):
         "id": uid, "email": p.email, "name": p.name, "username": p.username,
         "handle": f"@{p.username}", "dob": p.dob,
         "password_hash": hashpw(p.password), "is_verified": True,
+        "signup_method": "email", "phone_verified": False, "phone": None,
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
         "website": "", "location": "", "about": "", "language": "en",
@@ -512,7 +534,7 @@ async def email_signup(p: EmailSignupIn):
     }
     await db.users.insert_one(doc)
     await db.email_otps.delete_one({"email": p.email})
-    return {"token": make_token(uid), "user_id": uid}
+    return {"token": make_token(uid), "user_id": uid, "requires_phone": True}
 
 # ── Auth Phone ──────────────────────────────────────────────
 @api.post("/auth/phone-signup-init")
@@ -554,9 +576,10 @@ async def phone_signup(p: PhoneSignupIn):
     colors = ["#FFD600","#00C853","#FF1744","#29B6F6"]
     uid = str(uuid.uuid4())
     doc = {
-        "id": uid, "phone": p.phone, "email": f"{p.phone.replace('+','')}@phone.post",
+        "id": uid, "phone": p.phone, "email": None,
         "name": p.name, "username": p.username, "handle": f"@{p.username}", "dob": p.dob,
         "password_hash": hashpw(p.password), "is_verified": True,
+        "signup_method": "phone", "email_verified": False,
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
         "website": "", "location": "", "about": "", "language": "en",
@@ -569,7 +592,7 @@ async def phone_signup(p: PhoneSignupIn):
     }
     await db.users.insert_one(doc)
     await db.phone_otps.delete_one({"phone": p.phone})
-    return {"token": make_token(uid), "user_id": uid}
+    return {"token": make_token(uid), "user_id": uid, "requires_email": True}
 
 @api.post("/auth/phone-login")
 async def phone_login(p: PhoneLoginIn):
@@ -1092,6 +1115,65 @@ async def root():
         "twilio": bool(TWILIO_SID),
         "version": "2.0"
     }
+
+# ── Add Secondary Contact (Anti-Fake-Account) ───────────────
+@api.post("/auth/add-phone-init")
+async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
+    """Send SMS OTP to add phone (required for email-registered users)."""
+    if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
+    existing = await db.users.find_one({"phone": p.phone, "is_verified": True, "id": {"$ne": u["id"]}})
+    if existing: raise HTTPException(400, "This phone is already registered to another account")
+    code = f"{random.randint(0,9999):04d}"
+    await db.phone_otps.update_one(
+        {"phone": p.phone},
+        {"$set": {"phone": p.phone, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
+        upsert=True
+    )
+    sms_sent = send_otp_sms(p.phone, code)
+    return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
+
+@api.post("/auth/add-phone-verify")
+async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
+    """Verify SMS OTP and save phone."""
+    if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
+    rec = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
+    if not rec: raise HTTPException(400, "OTP not found. Please request a new one.")
+    exp = rec["otp_expires_at"]
+    if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+    if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
+    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    await db.users.update_one({"id": u["id"]}, {"$set": {"phone": p.phone, "phone_verified": True}})
+    await db.phone_otps.delete_one({"phone": p.phone})
+    return {"message": "Phone verified successfully", "token": make_token(u["id"])}
+
+@api.post("/auth/add-email-init")
+async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
+    """Send email OTP to add email (required for phone-registered users)."""
+    if u.get("email_verified"): raise HTTPException(400, "Email already verified")
+    existing = await db.users.find_one({"email": p.email, "is_verified": True, "id": {"$ne": u["id"]}})
+    if existing: raise HTTPException(400, "This email is already registered to another account")
+    code = f"{random.randint(0,9999):04d}"
+    await db.email_otps.update_one(
+        {"email": p.email},
+        {"$set": {"email": p.email, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
+        upsert=True
+    )
+    send_otp_email(p.email, code)
+    return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
+
+@api.post("/auth/add-email-verify")
+async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
+    """Verify email OTP and save email."""
+    if u.get("email_verified"): raise HTTPException(400, "Email already verified")
+    rec = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
+    if not rec: raise HTTPException(400, "OTP not found. Please request a new one.")
+    exp = rec["otp_expires_at"]
+    if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+    if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
+    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    await db.users.update_one({"id": u["id"]}, {"$set": {"email": p.email, "email_verified": True}})
+    await db.email_otps.delete_one({"email": p.email})
+    return {"message": "Email verified successfully", "token": make_token(u["id"])}
 
 # ── Seed ─────────────────────────────────────────────────────
 @app.on_event("startup")
