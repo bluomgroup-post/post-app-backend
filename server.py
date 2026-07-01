@@ -287,18 +287,6 @@ class ProfileUpdate(BaseModel):
     website: Optional[str] = None
     avatar_bg: Optional[str] = None
     avatar_letter: Optional[str] = None
-
-class AddPhoneInitIn(BaseModel):
-    phone: str
-
-class AddPhoneVerifyIn(BaseModel):
-    phone: str; otp: str
-
-class AddEmailInitIn(BaseModel):
-    email: EmailStr
-
-class AddEmailVerifyIn(BaseModel):
-    email: EmailStr; otp: str
     avatar_photo: Optional[str] = None
     profile_video: Optional[str] = None
     cover_photo: Optional[str] = None
@@ -319,6 +307,20 @@ class AddEmailVerifyIn(BaseModel):
         if not USERNAME_RE.match(v):
             raise ValueError("Username: 3-20 chars, only lowercase letters, numbers, underscore")
         return v
+
+class AddPhoneInitIn(BaseModel):
+    phone: str
+
+class AddPhoneVerifyIn(BaseModel):
+    phone: str
+    otp: str
+
+class AddEmailInitIn(BaseModel):
+    email: EmailStr
+
+class AddEmailVerifyIn(BaseModel):
+    email: EmailStr
+    otp: str
 
 class NotificationsPrefsIn(BaseModel):
     likes: Optional[bool] = None
