@@ -260,6 +260,7 @@ class ProfileUpdate(BaseModel):
     cover_photo: Optional[str] = None
     cover_video: Optional[str] = None
     language: Optional[str] = None
+    category: Optional[str] = None
 
     @field_validator("username")
     @classmethod
