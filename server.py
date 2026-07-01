@@ -15,10 +15,9 @@ MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME   = os.environ.get("DB_NAME", "postapp")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
-TWILIO_SID      = os.environ.get("TWILIO_SID", "").strip()
-TWILIO_TOKEN    = os.environ.get("TWILIO_TOKEN", "").strip()
-TWILIO_PHONE    = os.environ.get("TWILIO_PHONE", "").strip()
-FAST2SMS_KEY    = os.environ.get("FAST2SMS_API_KEY", "").strip()
+TWILIO_SID   = os.environ.get("TWILIO_SID", "").strip()
+TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN", "").strip()
+TWILIO_PHONE = os.environ.get("TWILIO_PHONE", "").strip()
 
 DEMO_MODE = not bool(RESEND_API_KEY)
 
@@ -147,33 +146,6 @@ postbluom.online"""
         logging.warning(f"Email failed: {e}")
 
 def send_otp_sms(phone, code):
-    # Indian number (+91) → Fast2SMS
-    if phone.startswith("+91") and FAST2SMS_KEY:
-        try:
-            import requests as _req
-            number = phone.replace("+91", "").strip()
-            resp = _req.get(
-                "https://www.fast2sms.com/dev/bulkV2",
-                params={
-                    "authorization": FAST2SMS_KEY,
-                    "variables_values": code,
-                    "route": "otp",
-                    "numbers": number,
-                },
-                timeout=10
-            )
-            result = resp.json()
-            if result.get("return") is True:
-                logging.info(f"✅ Fast2SMS OTP sent to {phone}")
-                return True
-            else:
-                logging.warning(f"Fast2SMS failed: {result}")
-                return False
-        except Exception as e:
-            logging.warning(f"Fast2SMS error: {e}")
-            return False
-
-    # Fallback: Twilio (non-Indian or no Fast2SMS key)
     if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_PHONE:
         logging.info(f"[DEMO] SMS OTP for {phone}: {code}")
         return False
@@ -185,10 +157,10 @@ def send_otp_sms(phone, code):
             from_=TWILIO_PHONE,
             to=phone
         )
-        logging.info(f"✅ Twilio SMS sent to {phone}")
+        logging.info(f"SMS sent to {phone}")
         return True
     except Exception as e:
-        logging.warning(f"Twilio SMS failed: {e}")
+        logging.warning(f"SMS failed: {e}")
         return False
 
 async def ensure_username_unique(username: str, exclude_uid: Optional[str] = None):
