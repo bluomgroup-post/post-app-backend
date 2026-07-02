@@ -824,11 +824,12 @@ async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, ski
         ]
     # Feed mode: only posts from users I follow
     following_ids = u.get("following", [])
-    if feed and following_ids:
-        query["user_id"] = {"$in": following_ids}
-    elif feed:
-        # Following nobody yet — return empty feed
-        return {"posts": [], "total": 0, "skip": skip, "limit": limit}
+    if feed:
+        feed_ids = list(set(following_ids + [u["id"]]))
+        if not following_ids:
+            query["user_id"] = u["id"]
+        else:
+            query["user_id"] = {"$in": feed_ids}
     posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     total = await db.posts.count_documents(query)
     
@@ -1234,7 +1235,7 @@ async def list_messages(with_user: Optional[str] = None, skip: int = 0, limit: i
     else:
         q = {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]}
     
-    msgs = await db.messages.find(q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    msgs = await db.messages.find(q, {"_id": 0}).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
     total = await db.messages.count_documents(q)
     
     # Mark as read
