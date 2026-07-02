@@ -39,22 +39,52 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 logging.basicConfig(level=logging.INFO)
 
 def now(): return datetime.now(timezone.utc)
+import hashlib as _hl, hmac as _hmac, os as _os
+
 async def _run_sync(fn):
-    """Run a sync function in the default thread pool (non-blocking)."""
-    loop = asyncio.get_event_loop()
+    """Run a sync callable in thread pool — keeps event loop free."""
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, fn)
 
-async def hashpw(p, rounds=10):
-    return await _run_sync(lambda: bcrypt.hashpw(p.encode(), bcrypt.gensalt(rounds=rounds)).decode())
-
-async def verifypw(p, h):
-    try: return await _run_sync(lambda: bcrypt.checkpw(p.encode(), h.encode()))
-    except: return False
-
 async def run_in_bg(fn, *args):
-    """Run a blocking IO/CPU function in thread pool (non-blocking for asyncio)."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, fn, *args)
+
+# ── Fast password hashing (PBKDF2-HMAC-SHA256, ~0.3s even on slow CPU) ───────
+_PBKDF2_ITER = 260_000
+_PBKDF2_PREFIX = "$pbkdf2$"
+
+def _pbkdf2_hash(password: str, salt: str) -> str:
+    return _hl.pbkdf2_hmac("sha256", password.encode(), salt.encode(), _PBKDF2_ITER).hex()
+
+async def hashpw(p: str, rounds=None) -> str:
+    """Hash a password with PBKDF2 (fast, runs in thread)."""
+    salt = _os.urandom(16).hex()
+    digest = await _run_sync(lambda: _pbkdf2_hash(p, salt))
+    return f"{_PBKDF2_PREFIX}{salt}${digest}"
+
+async def verifypw(p: str, h: str) -> bool:
+    """Verify password. Supports both PBKDF2 (new, fast) and bcrypt (legacy, slow first time)."""
+    if not h:
+        return False
+    if h.startswith(_PBKDF2_PREFIX):
+        # Fast path: PBKDF2
+        try:
+            parts = h.split("$")  # ["", "pbkdf2", salt, digest]
+            salt, stored = parts[2], parts[3]
+            computed = await _run_sync(lambda: _pbkdf2_hash(p, salt))
+            return _hmac.compare_digest(computed, stored)
+        except Exception:
+            return False
+    else:
+        # Legacy bcrypt path — run in thread so event loop stays free
+        try:
+            return await _run_sync(lambda: bcrypt.checkpw(p.encode(), h.encode()))
+        except Exception:
+            return False
+
+def _is_bcrypt(h: str) -> bool:
+    return h.startswith("$2b$") or h.startswith("$2a$")
 def make_token(uid):
     return jwt.encode({"sub": uid, "exp": now() + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
 
@@ -434,10 +464,9 @@ async def login(p: LoginIn):
     ok = await verifypw(p.password, pw_hash)
     if not ok: raise HTTPException(400, "Invalid credentials")
     if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
-    # Re-hash with rounds=10 if stored hash uses higher cost (silently upgrade)
-    if pw_hash and b"$2b$12$" in pw_hash.encode()[:10]:
-        new_hash = await hashpw(p.password, rounds=10)
-        asyncio.create_task(db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": new_hash}}))
+    # Auto-migrate legacy bcrypt hash → fast PBKDF2 hash in background
+    if _is_bcrypt(pw_hash):
+        asyncio.create_task(_migrate_hash(u["id"], p.password))
     resp = {"token": make_token(u["id"]), "user_id": u["id"]}
     if u.get("deleted_at"):
         deleted_at = _aware(u["deleted_at"])
@@ -632,9 +661,8 @@ async def phone_login(p: PhoneLoginIn):
     u = await db.users.find_one({"phone": p.phone})
     pw_hash_p = u.get("password_hash", "") if u else ""
     if not u or not await verifypw(p.password, pw_hash_p): raise HTTPException(400, "Invalid phone or password")
-    if u and pw_hash_p and b"$2b$12$" in pw_hash_p.encode()[:10]:
-        new_hash_p = await hashpw(p.password, rounds=10)
-        asyncio.create_task(db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": new_hash_p}}))
+    if u and _is_bcrypt(pw_hash_p):
+        asyncio.create_task(_migrate_hash(u["id"], p.password))
     if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
     resp = {"token": make_token(u["id"]), "user_id": u["id"]}
     if u.get("deleted_at"):
@@ -1582,6 +1610,16 @@ async def translate_endpoint(body: dict):
     return {"translated": translated, "tone_hint": tone_hint}
 
 # ── Health ───────────────────────────────────────────────────
+
+async def _migrate_hash(uid: str, password: str):
+    """Background task: replace bcrypt hash with fast PBKDF2 hash after successful login."""
+    try:
+        new_hash = await hashpw(password)
+        await db.users.update_one({"id": uid}, {"$set": {"password_hash": new_hash}})
+        logging.info(f"✅ Migrated password hash for {uid}")
+    except Exception as e:
+        logging.warning(f"Hash migration failed for {uid}: {e}")
+
 @api.get("/")
 async def root(): 
     return {
@@ -1759,6 +1797,16 @@ app.include_router(api)
 async def shutdown(): client.close()
 
 # ── Health ───────────────────────────────────────────────────
+
+async def _migrate_hash(uid: str, password: str):
+    """Background task: replace bcrypt hash with fast PBKDF2 hash after successful login."""
+    try:
+        new_hash = await hashpw(password)
+        await db.users.update_one({"id": uid}, {"$set": {"password_hash": new_hash}})
+        logging.info(f"✅ Migrated password hash for {uid}")
+    except Exception as e:
+        logging.warning(f"Hash migration failed for {uid}: {e}")
+
 @api.get("/")
 async def root(): 
     return {
