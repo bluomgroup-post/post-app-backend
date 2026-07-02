@@ -1325,6 +1325,197 @@ async def change_password(p: ChangePasswordIn, u=Depends(current_user)):
     await db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": hashpw(p.new_password)}})
     return {"message": "Password updated successfully"}
 
+# ── Username availability check ──────────────────────────────
+@api.get("/check-username")
+async def check_username(username: str, u=Depends(current_user)):
+    """Check if a username is available (excluding current user)"""
+    import re
+    if not re.match(r'^[a-z0-9_]{3,30} (POST's own — no Google dependency) ─────────
+TRANSLATE_LANG_MAP = {
+    "zh": "zh-CN", "en": "en", "hi": "hi", "ur": "ur", "es": "es",
+    "fr": "fr", "ar": "ar", "pt": "pt", "de": "de", "ja": "ja",
+    "ru": "ru", "bn": "bn", "id": "id", "tr": "tr",
+}
+
+@api.post("/translate")
+async def translate_endpoint(body: dict):
+    """POST App's own translation endpoint — uses MyMemory (free, no key needed)."""
+    text   = (body.get("text") or "").strip()
+    target = body.get("target", "en")
+    if not text:
+        return {"translated": text}
+    tl = TRANSLATE_LANG_MAP.get(target, target)
+
+    # Primary: MyMemory free API (no key, 1000 words/day anonymous)
+    try:
+        url = (
+            "https://api.mymemory.translated.world/get"
+            f"?q={urllib.parse.quote(text)}&langpair=autodetect|{tl}"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+        def _fetch():
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return _json.loads(resp.read().decode())
+        data = await asyncio.to_thread(_fetch)
+        translated = (data.get("responseData") or {}).get("translatedText", "")
+        # MyMemory returns quota warning as translated text — ignore it
+        if translated and "MYMEMORY WARNING" not in translated and translated != text:
+            return {"translated": translated}
+    except Exception as e:
+        logging.warning(f"MyMemory translation failed: {e}")
+
+    # Fallback: LibreTranslate public instance
+    try:
+        lt_body = _json.dumps({"q": text, "source": "auto", "target": tl, "format": "text"}).encode()
+        lt_req  = urllib.request.Request(
+            "https://libretranslate.com/translate",
+            data=lt_body,
+            headers={"Content-Type": "application/json", "User-Agent": "PostApp/1.0"},
+            method="POST"
+        )
+        def _fetch_lt():
+            with urllib.request.urlopen(lt_req, timeout=6) as resp:
+                return _json.loads(resp.read().decode())
+        lt_data = await asyncio.to_thread(_fetch_lt)
+        translated = lt_data.get("translatedText", "")
+        if translated and translated != text:
+            return {"translated": translated}
+    except Exception as e:
+        logging.warning(f"LibreTranslate fallback failed: {e}")
+
+    # Final fallback: return original text unchanged
+    return {"translated": text}
+
+# ── Health ───────────────────────────────────────────────────
+@api.get("/")
+async def root(): 
+    return {
+        "status": "ok", 
+        "demo_mode": DEMO_MODE, 
+        "twilio": bool(TWILIO_SID),
+        "version": "2.0"
+    }
+
+# ── Add Secondary Contact (Anti-Fake-Account) ───────────────
+@api.post("/auth/add-phone-init")
+async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
+    """Send SMS OTP to add phone (required for email-registered users)."""
+    if u.get("signup_method") != "email": raise HTTPException(403, "This endpoint is only for email-registered accounts")
+    if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
+    existing = await db.users.find_one({"phone": p.phone, "is_verified": True, "id": {"$ne": u["id"]}})
+    if existing: raise HTTPException(400, "This phone is already registered to another account")
+    code = f"{random.randint(0,9999):04d}"
+    await db.phone_otps.update_one(
+        {"phone": p.phone},
+        {"$set": {"phone": p.phone, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
+        upsert=True
+    )
+    sms_sent = send_otp_sms(p.phone, code)
+    return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
+
+@api.post("/auth/add-phone-verify")
+async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
+    """Verify SMS OTP and save phone."""
+    if u.get("signup_method") != "email": raise HTTPException(403, "This endpoint is only for email-registered accounts")
+    if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
+    rec = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
+    if not rec: raise HTTPException(400, "OTP not found. Please request a new one.")
+    exp = rec["otp_expires_at"]
+    if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+    if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
+    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    await db.users.update_one({"id": u["id"]}, {"$set": {"phone": p.phone, "phone_verified": True}})
+    await db.phone_otps.delete_one({"phone": p.phone})
+    return {"message": "Phone verified successfully", "token": make_token(u["id"])}
+
+@api.post("/auth/add-email-init")
+async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
+    """Send email OTP to add email (required for phone-registered users)."""
+    if u.get("signup_method") != "phone": raise HTTPException(403, "This endpoint is only for phone-registered accounts")
+    if u.get("email_verified"): raise HTTPException(400, "Email already verified")
+    existing = await db.users.find_one({"email": p.email, "is_verified": True, "id": {"$ne": u["id"]}})
+    if existing: raise HTTPException(400, "This email is already registered to another account")
+    code = f"{random.randint(0,9999):04d}"
+    await db.email_otps.update_one(
+        {"email": p.email},
+        {"$set": {"email": p.email, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
+        upsert=True
+    )
+    send_otp_email(p.email, code)
+    return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
+
+@api.post("/auth/add-email-verify")
+async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
+    """Verify email OTP and save email."""
+    if u.get("signup_method") != "phone": raise HTTPException(403, "This endpoint is only for phone-registered accounts")
+    if u.get("email_verified"): raise HTTPException(400, "Email already verified")
+    rec = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
+    if not rec: raise HTTPException(400, "OTP not found. Please request a new one.")
+    exp = rec["otp_expires_at"]
+    if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+    if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
+    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    await db.users.update_one({"id": u["id"]}, {"$set": {"email": p.email, "email_verified": True}})
+    await db.email_otps.delete_one({"email": p.email})
+    return {"message": "Email verified successfully", "token": make_token(u["id"])}
+
+# ── Seed ─────────────────────────────────────────────────────
+@app.on_event("startup")
+async def seed():
+    if await db.users.count_documents({"is_seed": True}) > 0: return
+    WORLD = [
+        ("Aryan","@aryan_world","Mumbai, India","Photographer & traveller 📷","Asia","#FFD600"),
+        ("Bella","@bella_creates","London, UK","Designer. Coffee lover ☕","Europe","#00C853"),
+        ("Carlos","@carlos_global","Mexico City","Entrepreneur 🚀","Americas","#29B6F6"),
+        ("Yuki","@yuki_jp","Tokyo, Japan","Manga artist 🎨","Asia","#00C853"),
+        ("Fatima","@fatima_sa","Riyadh, Saudi Arabia","Writer & poet ✍️","Asia","#FF1744"),
+        ("Pierre","@pierre_fr","Paris, France","Chef & food blogger 🥐","Europe","#FF1744"),
+        ("Lucas","@lucas_br","São Paulo, Brazil","Carnaval organizer 🎉","Americas","#00C853"),
+        ("Chioma","@chioma_ng","Lagos, Nigeria","Fashion designer 👗","Africa","#29B6F6"),
+        ("Jack","@jack_au","Sydney, Australia","Surfer & barista ☕","Oceania","#00C853"),
+        ("Soo-Jin","@soojin_kr","Seoul, South Korea","K-pop enthusiast 🎵","Asia","#FF1744"),
+        ("Anna","@anna_se","Stockholm, Sweden","Environmentalist 🌿","Europe","#29B6F6"),
+        ("Amara","@amara_ke","Nairobi, Kenya","Safari guide 🦁","Africa","#FFD600"),
+    ]
+    for name, handle, loc, about, continent, color in WORLD:
+        uid = str(uuid.uuid4())
+        await db.users.insert_one({
+            "id": uid, 
+            "email": f"{handle[1:]}@post.demo", 
+            "username": handle[1:], 
+            "name": name, 
+            "handle": handle, 
+            "is_verified": True, 
+            "is_seed": True, 
+            "avatar_bg": color,
+            "avatar_letter": name[0], 
+            "location": loc, 
+            "about": about, 
+            "continent": continent,
+            "created_at": now(),
+            "followers": [],
+            "following": [],
+            "blocked_users": [],
+            "notifications_prefs": {
+                "likes": True,
+                "comments": True,
+                "friend_requests": True,
+                "messages": True
+            }
+        })
+    logging.info("✅ World users seeded")
+
+app.include_router(api)
+
+@app.on_event("shutdown")
+async def shutdown(): client.close()
+, username):
+        return {"available": False, "reason": "3-30 chars, only a-z 0-9 _"}
+    existing = await db.users.find_one({"username": username})
+    if existing and existing["id"] != u["id"]:
+        return {"available": False, "reason": "Already taken"}
+    return {"available": True, "reason": "Available!"}
+
 # ── Translation (POST's own — no Google dependency) ─────────
 TRANSLATE_LANG_MAP = {
     "zh": "zh-CN", "en": "en", "hi": "hi", "ur": "ur", "es": "es",
