@@ -804,7 +804,16 @@ async def get_user(user_id: str, u=Depends(current_user)):
             {"from_id": u["id"], "to_id": user_id, "status": "pending"}
         )
 
-    posts_count = await db.posts.count_documents({"user_id": user_id})
+    # Parallelize DB calls
+    posts_count_task = db.posts.count_documents({"user_id": user_id})
+    follow_req_task = (
+        db.follow_requests.find_one({"from_id": u["id"], "to_id": user_id, "status": "pending"})
+        if is_private_locked else None
+    )
+    if follow_req_task is not None:
+        posts_count, pending_req = await asyncio.gather(posts_count_task, follow_req_task)
+    else:
+        posts_count = await posts_count_task
     is_mutual = user_id in u.get("following", []) and u["id"] in (user.get("following") or [])
     is_following_you = u["id"] in user.get("following", [])
     followers_count = len(user.get("followers", []))
@@ -869,8 +878,10 @@ async def create_post(p: PostIn, u=Depends(current_user)):
     return doc
 
 @api.get("/posts")
-async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, skip: int = 0, limit: int = 50, feed: bool = False, u=Depends(current_user)):
+async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, skip: int = 0, limit: int = 20, feed: bool = False, u=Depends(current_user)):
     query = {}
+    following_ids = u.get("following", [])
+
     if user_id:
         # Private account check — only followers can see posts
         target_user = await db.users.find_one({"id": user_id}, {"is_private": 1, "followers": 1})
@@ -878,42 +889,46 @@ async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, ski
             if u["id"] not in target_user.get("followers", []):
                 return {"posts": [], "total": 0, "skip": skip, "limit": limit, "private_locked": True}
         query["user_id"] = user_id
-    if q:
-        query["$or"] = [
-            {"content": {"$regex": q, "$options": "i"}}, 
-            {"user_name": {"$regex": q, "$options": "i"}}, 
-            {"location": {"$regex": q, "$options": "i"}}
-        ]
-    # Feed mode: only posts from users I follow
-    following_ids = u.get("following", [])
-    if feed:
+    elif feed:
+        # Feed mode: posts from followed users + self only
         feed_ids = list(set(following_ids + [u["id"]]))
-        if following_ids:
-            query["user_id"] = {"$in": feed_ids}
-    # Filter out posts from private accounts that viewer doesn't follow
-    if not user_id:
-        viewer_can_see = set(u.get("following", []) + [u["id"]])
+        query["user_id"] = {"$in": feed_ids}
+        # No private-account scan needed — we already only show followed users
+    else:
+        if q:
+            query["$or"] = [
+                {"content": {"$regex": q, "$options": "i"}},
+                {"user_name": {"$regex": q, "$options": "i"}},
+                {"location": {"$regex": q, "$options": "i"}}
+            ]
+        # Discover mode: hide private accounts the viewer doesn't follow
+        viewer_can_see = set(following_ids + [u["id"]])
         priv_cursor = db.users.find(
             {"is_private": True, "id": {"$nin": list(viewer_can_see)}},
             {"id": 1, "_id": 0}
         )
         private_ids = [p["id"] async for p in priv_cursor]
         if private_ids:
-            if "$and" not in query:
-                query["$and"] = []
-            query["$and"].append({"user_id": {"$nin": private_ids}})
+            query["user_id"] = {"$nin": private_ids}
+
+    if q and user_id:
+        query["$or"] = [
+            {"content": {"$regex": q, "$options": "i"}},
+            {"user_name": {"$regex": q, "$options": "i"}},
+            {"location": {"$regex": q, "$options": "i"}}
+        ]
 
     posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
-    total = await db.posts.count_documents(query)
-    
-    # Bulk view tracking (single DB query instead of N queries)
+
+    # Background view tracking — don't block the response
     unviewed_ids = [p["id"] for p in posts if u["id"] not in p.get("views", [])]
     if unviewed_ids:
-        await db.posts.update_many(
+        asyncio.create_task(db.posts.update_many(
             {"id": {"$in": unviewed_ids}},
             {"$addToSet": {"views": u["id"]}}
-        )
-    return {"posts": posts, "total": total, "skip": skip, "limit": limit}
+        ))
+
+    return {"posts": posts, "has_more": len(posts) == limit, "skip": skip, "limit": limit}
 
 @api.get("/posts/{pid}")
 async def get_post(pid: str, u=Depends(current_user)):
@@ -1626,7 +1641,7 @@ async def root():
         "status": "ok", 
         "demo_mode": DEMO_MODE, 
         "twilio": bool(TWILIO_SID),
-        "version": "3.0"
+        "version": "5.0"
     }
 
 # ── Add Secondary Contact (Anti-Fake-Account) ───────────────
@@ -1813,7 +1828,7 @@ async def root():
         "status": "ok", 
         "demo_mode": DEMO_MODE, 
         "twilio": bool(TWILIO_SID),
-        "version": "3.0"
+        "version": "5.0"
     }
 
 # ── Add Secondary Contact (Anti-Fake-Account) ───────────────
