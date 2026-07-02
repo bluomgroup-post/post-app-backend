@@ -835,6 +835,19 @@ async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, ski
         feed_ids = list(set(following_ids + [u["id"]]))
         if following_ids:
             query["user_id"] = {"$in": feed_ids}
+    # Filter out posts from private accounts that viewer doesn't follow
+    if not user_id:
+        viewer_can_see = set(u.get("following", []) + [u["id"]])
+        priv_cursor = db.users.find(
+            {"is_private": True, "id": {"$nin": list(viewer_can_see)}},
+            {"id": 1, "_id": 0}
+        )
+        private_ids = [p["id"] async for p in priv_cursor]
+        if private_ids:
+            if "$and" not in query:
+                query["$and"] = []
+            query["$and"].append({"user_id": {"$nin": private_ids}})
+
     posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     total = await db.posts.count_documents(query)
     
