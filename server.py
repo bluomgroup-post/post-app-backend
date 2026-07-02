@@ -1601,6 +1601,41 @@ async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
     await db.email_otps.delete_one({"email": p.email})
     return {"message": "Email verified successfully", "token": make_token(u["id"])}
 
+
+# ── DB Indexes (performance) ─────────────────────────────────
+@app.on_event('startup')
+async def create_indexes():
+    try:
+        # Users
+        await db.users.create_index('id', unique=True, background=True)
+        await db.users.create_index('username', background=True)
+        await db.users.create_index('email', background=True)
+        await db.users.create_index('phone', background=True)
+        await db.users.create_index('handle', background=True)
+        # Posts
+        await db.posts.create_index('user_id', background=True)
+        await db.posts.create_index([('created_at', -1)], background=True)
+        await db.posts.create_index('id', unique=True, background=True)
+        # Messages
+        await db.messages.create_index([('from_id', 1), ('to_id', 1)], background=True)
+        await db.messages.create_index([('created_at', 1)], background=True)
+        # Notifications
+        await db.notifications.create_index('to_id', background=True)
+        await db.notifications.create_index([('created_at', -1)], background=True)
+        # Follow / Friend requests
+        await db.follow_requests.create_index([('from_id', 1), ('to_id', 1)], background=True)
+        await db.follow_requests.create_index('status', background=True)
+        await db.friend_requests.create_index([('from_id', 1), ('to_id', 1)], background=True)
+        await db.friend_requests.create_index('status', background=True)
+        # OTPs
+        await db.email_otps.create_index('email', background=True)
+        await db.phone_otps.create_index('phone', background=True)
+        # Account deletions
+        await db.account_deletions.create_index('identifier', background=True)
+        logging.info('✅ MongoDB indexes created')
+    except Exception as e:
+        logging.warning(f'Index creation warning: {e}')
+
 # ── Seed ─────────────────────────────────────────────────────
 @app.on_event("startup")
 async def seed():
@@ -1775,3 +1810,4 @@ app.include_router(api)
 
 @app.on_event("shutdown")
 async def shutdown(): client.close()
+
