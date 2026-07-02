@@ -1031,6 +1031,13 @@ async def get_following(user_id: str, u=Depends(current_user)):
     ).to_list(500)
     return following
 
+@api.post("/users/me/remove-follower/{follower_id}")
+async def remove_follower(follower_id: str, u=Depends(current_user)):
+    """Remove a follower from your own followers list"""
+    await db.users.update_one({"id": u["id"]}, {"$pull": {"followers": follower_id}})
+    await db.users.update_one({"id": follower_id}, {"$pull": {"following": u["id"]}})
+    return {"ok": True}
+
 # ── Follow Requests (private accounts) ────────────────────────
 @api.post("/users/{user_id}/follow-request/cancel")
 async def cancel_follow_request(user_id: str, u=Depends(current_user)):
