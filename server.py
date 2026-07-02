@@ -298,6 +298,8 @@ class ProfileUpdate(BaseModel):
     is_private: Optional[bool] = None
     theme: Optional[str] = None
     chat_translation_enabled: Optional[bool] = None
+    account_type: Optional[str] = None      # personal | politician | businessman | organisation
+    is_badge_verified: Optional[bool] = None  # admin-granted verified badge
 
     @field_validator("username")
     @classmethod
@@ -755,7 +757,7 @@ async def create_post(p: PostIn, u=Depends(current_user)):
     return doc
 
 @api.get("/posts")
-async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, skip: int = 0, limit: int = 50, u=Depends(current_user)):
+async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, skip: int = 0, limit: int = 50, feed: bool = False, u=Depends(current_user)):
     query = {}
     if user_id:
         query["user_id"] = user_id
@@ -765,6 +767,13 @@ async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, ski
             {"user_name": {"$regex": q, "$options": "i"}}, 
             {"location": {"$regex": q, "$options": "i"}}
         ]
+    # Feed mode: only posts from users I follow
+    following_ids = u.get("following", [])
+    if feed and following_ids:
+        query["user_id"] = {"$in": following_ids}
+    elif feed:
+        # Following nobody yet — return empty feed
+        return {"posts": [], "total": 0, "skip": skip, "limit": limit}
     posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     total = await db.posts.count_documents(query)
     
@@ -883,19 +892,47 @@ async def delete_comment(pid: str, cid: str, u=Depends(current_user)):
 # ── Followers/Following ──────────────────────────────────────
 @api.post("/users/{user_id}/follow")
 async def follow_user(user_id: str, u=Depends(current_user)):
-    """Follow a user"""
+    """Follow a user. If target has private account, creates a pending follow_request instead."""
     if user_id == u["id"]: raise HTTPException(400, "Can't follow yourself")
     
     target = await db.users.find_one({"id": user_id})
     if not target: raise HTTPException(404, "User not found")
-    
-    # Add to following
+
+    # Block if caller is blocked by target
+    if u["id"] in target.get("blocked_users", []):
+        raise HTTPException(403, "Action not allowed")
+
+    # Private account → create pending follow request instead of direct follow
+    if target.get("is_private"):
+        existing = await db.follow_requests.find_one({"from_id": u["id"], "to_id": user_id})
+        if existing:
+            return {"ok": True, "pending": True}
+        await db.follow_requests.insert_one({
+            "id": str(uuid.uuid4()),
+            "from_id": u["id"],
+            "to_id": user_id,
+            "status": "pending",
+            "created_at": now().isoformat()
+        })
+        # Notify the private-account owner
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "from_user_id": u["id"],
+            "from_user_name": u["name"],
+            "type": "follow_request",
+            "created_at": now().isoformat(),
+            "read": False
+        })
+        return {"ok": True, "pending": True}
+
+    # Public account → direct follow
     if u["id"] not in target.get("followers", []):
         await db.users.update_one({"id": user_id}, {"$push": {"followers": u["id"]}})
     if user_id not in u.get("following", []):
         await db.users.update_one({"id": u["id"]}, {"$push": {"following": user_id}})
     
-    # Create notification
+    # Notify
     await db.notifications.insert_one({
         "id": str(uuid.uuid4()),
         "user_id": user_id,
@@ -906,7 +943,7 @@ async def follow_user(user_id: str, u=Depends(current_user)):
         "read": False
     })
     
-    return {"ok": True}
+    return {"ok": True, "pending": False}
 
 @api.post("/users/{user_id}/unfollow")
 async def unfollow_user(user_id: str, u=Depends(current_user)):
@@ -939,10 +976,67 @@ async def get_following(user_id: str, u=Depends(current_user)):
     ).to_list(500)
     return following
 
+# ── Follow Requests (private accounts) ────────────────────────
+@api.post("/users/{user_id}/follow-request/cancel")
+async def cancel_follow_request(user_id: str, u=Depends(current_user)):
+    """Cancel outgoing follow request (for private accounts)"""
+    await db.follow_requests.delete_one({"from_id": u["id"], "to_id": user_id})
+    return {"ok": True}
+
+@api.post("/users/{user_id}/follow-request/accept")
+async def accept_follow_request(user_id: str, u=Depends(current_user)):
+    """Accept incoming follow request (private account owner calls this)"""
+    req = await db.follow_requests.find_one({"from_id": user_id, "to_id": u["id"], "status": "pending"})
+    if not req: raise HTTPException(404, "Follow request not found")
+    # Add to followers/following
+    await db.users.update_one({"id": u["id"]}, {"$addToSet": {"followers": user_id}})
+    await db.users.update_one({"id": user_id}, {"$addToSet": {"following": u["id"]}})
+    await db.follow_requests.delete_one({"from_id": user_id, "to_id": u["id"]})
+    # Notify requester
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "from_user_id": u["id"],
+        "from_user_name": u["name"],
+        "type": "follow_accept",
+        "created_at": now().isoformat(),
+        "read": False
+    })
+    return {"ok": True}
+
+@api.post("/users/{user_id}/follow-request/decline")
+async def decline_follow_request(user_id: str, u=Depends(current_user)):
+    """Decline incoming follow request (private account owner calls this)"""
+    await db.follow_requests.delete_one({"from_id": user_id, "to_id": u["id"]})
+    return {"ok": True}
+
+@api.get("/users/me/follow-requests")
+async def my_follow_requests(u=Depends(current_user)):
+    """Get incoming pending follow requests (for private account owners)"""
+    pending = await db.follow_requests.find({"to_id": u["id"], "status": "pending"}, {"_id": 0}).to_list(500)
+    from_ids = [r["from_id"] for r in pending]
+    PUBLIC = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+              "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1, "location": 1, "about": 1}
+    users_list = await db.users.find({"id": {"$in": from_ids}}, PUBLIC).to_list(500) if from_ids else []
+    users_map = {u2["id"]: u2 for u2 in users_list}
+    for r in pending:
+        r["from_user"] = users_map.get(r["from_id"], {})
+    # Outgoing (requests I sent to private accounts)
+    outgoing = await db.follow_requests.find({"from_id": u["id"], "status": "pending"}, {"_id": 0}).to_list(500)
+    return {"incoming": pending, "outgoing": outgoing}
+
 # ── Friends ──────────────────────────────────────────────────
 @api.post("/friends/request")
 async def friend_request(p: FriendIn, u=Depends(current_user)):
     if p.target_user_id == u["id"]: raise HTTPException(400, "Can't friend yourself")
+    target = await db.users.find_one({"id": p.target_user_id})
+    if not target: raise HTTPException(404, "User not found")
+    # Organisation accounts cannot be connected — only followed
+    if target.get("account_type") == "organisation":
+        raise HTTPException(400, "You can only follow organisation accounts, not connect")
+    # Badge-verified accounts (politicians/businessmen) cannot receive connect/chat requests
+    if target.get("is_badge_verified"):
+        raise HTTPException(400, "Verified public figures can only be followed, not connected")
     # Block duplicate outgoing request
     existing = await db.friend_requests.find_one({"from_id": u["id"], "to_id": p.target_user_id})
     if existing: return {"status": existing["status"]}
