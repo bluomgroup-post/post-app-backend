@@ -1,6 +1,7 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 import os, uuid, random, logging, bcrypt, jwt, re, io
@@ -26,13 +27,14 @@ ABUSE_WINDOW_DAYS = 90
 ABUSE_MAX_DELETIONS = 3
 ABUSE_COOLDOWN_DAYS = 14
 
-client = AsyncIOMotorClient(MONGO_URL)
+client = AsyncIOMotorClient(MONGO_URL, maxPoolSize=20, minPoolSize=5, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
 db = client[DB_NAME]
 
 app = FastAPI(title="POST App API")
 api = APIRouter(prefix="/api")
 bearer = HTTPBearer(auto_error=False)
 
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 logging.basicConfig(level=logging.INFO)
 
@@ -853,11 +855,13 @@ async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, ski
     posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     total = await db.posts.count_documents(query)
     
-    # Add view tracking
-    for post in posts:
-        if u["id"] not in post.get("views", []):
-            await db.posts.update_one({"id": post["id"]}, {"$push": {"views": u["id"]}})
-    
+    # Bulk view tracking (single DB query instead of N queries)
+    unviewed_ids = [p["id"] for p in posts if u["id"] not in p.get("views", [])]
+    if unviewed_ids:
+        await db.posts.update_many(
+            {"id": {"$in": unviewed_ids}},
+            {"$addToSet": {"views": u["id"]}}
+        )
     return {"posts": posts, "total": total, "skip": skip, "limit": limit}
 
 @api.get("/posts/{pid}")
@@ -1325,13 +1329,16 @@ async def get_conversations(u=Depends(current_user)):
            "is_online": 1, "last_seen": 1}
     users_list = await db.users.find({"id": {"$in": user_ids}}, pub).to_list(200)
     users_map = {uu["id"]: uu for uu in users_list}
-    # Unread counts
-    for c in convs:
-        c["user"] = users_map.get(c["_id"], {})
-        c["unread"] = await db.messages.count_documents({
-            "from_id": c["_id"], "to_id": u["id"], "status": {"$ne": "seen"},
-            "deleted_for_everyone": {"$ne": True}
+    # Parallel unread counts (all at once instead of sequentially)
+    async def _unread(cid):
+        return await db.messages.count_documents({
+            "from_id": cid, "to_id": u["id"],
+            "status": {"$ne": "seen"}, "deleted_for_everyone": {"$ne": True}
         })
+    unread_counts = await asyncio.gather(*[_unread(c["_id"]) for c in convs])
+    for c, uc in zip(convs, unread_counts):
+        c["user"] = users_map.get(c["_id"], {})
+        c["unread"] = uc
     convs.sort(key=lambda x: x.get("last_time", ""), reverse=True)
     return {"conversations": convs}
 
@@ -1391,6 +1398,23 @@ async def mark_all_notifications_read(u=Depends(current_user)):
         {"$set": {"read": True}}
     )
     return {"ok": True}
+
+
+@api.get("/notifications/unread-count")
+async def get_notif_unread_count(u=Depends(current_user)):
+    """Lightweight polling endpoint: just the unread notification count."""
+    count = await db.notifications.count_documents({"user_id": u["id"], "read": False})
+    return {"unread_count": count}
+
+@api.get("/messages/unread-count")
+async def get_msg_unread_count(u=Depends(current_user)):
+    """Lightweight polling endpoint: just the total unread message count."""
+    count = await db.messages.count_documents({
+        "to_id": u["id"],
+        "status": {"$ne": "seen"},
+        "deleted_for_everyone": {"$ne": True}
+    })
+    return {"unread_count": count}
 
 # ── Block Users ──────────────────────────────────────────────
 @api.post("/users/{user_id}/block")
@@ -1484,6 +1508,11 @@ async def translate_endpoint(body: dict):
         return {"translated": text, "tone_hint": None}
     tl = TRANSLATE_LANG_MAP.get(target, target)
 
+    cache_key = tl + "||" + text
+    cached = _cache_get(cache_key)
+    if cached:
+        return {"translated": cached, "tone_hint": _detect_tone_hint(text) if include_tone else None}
+
     translated = None
     # Primary: MyMemory free API (no key, 1000 words/day anonymous)
     try:
@@ -1526,6 +1555,7 @@ async def translate_endpoint(body: dict):
         translated = text
 
     tone_hint = _detect_tone_hint(text) if include_tone else None
+    _cache_set(cache_key, translated)
     return {"translated": translated, "tone_hint": tone_hint}
 
 # ── Health ───────────────────────────────────────────────────
@@ -1601,6 +1631,24 @@ async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
     await db.email_otps.delete_one({"email": p.email})
     return {"message": "Email verified successfully", "token": make_token(u["id"])}
 
+
+
+# ── Translation Cache (in-memory, TTL 1 hour) ─────────────────
+import time as _time
+_trans_cache: dict = {}
+_TRANS_TTL = 3600
+
+def _cache_get(key):
+    entry = _trans_cache.get(key)
+    if entry and (_time.monotonic() - entry[1]) < _TRANS_TTL:
+        return entry[0]
+    return None
+
+def _cache_set(key, value):
+    if len(_trans_cache) > 2000:
+        oldest = sorted(_trans_cache, key=lambda k: _trans_cache[k][1])[:500]
+        for k in oldest: del _trans_cache[k]
+    _trans_cache[key] = (value, _time.monotonic())
 
 # ── DB Indexes (performance) ─────────────────────────────────
 @app.on_event('startup')
