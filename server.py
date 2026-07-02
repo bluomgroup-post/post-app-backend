@@ -1638,61 +1638,6 @@ app.include_router(api)
 
 @app.on_event("shutdown")
 async def shutdown(): client.close()
-# ── Translation (POST's own — no Google dependency) ─────────
-TRANSLATE_LANG_MAP = {
-    "zh": "zh-CN", "en": "en", "hi": "hi", "ur": "ur", "es": "es",
-    "fr": "fr", "ar": "ar", "pt": "pt", "de": "de", "ja": "ja",
-    "ru": "ru", "bn": "bn", "id": "id", "tr": "tr",
-}
-
-@api.post("/translate")
-async def translate_endpoint(body: dict):
-    """POST App's own translation endpoint — uses MyMemory (free, no key needed)."""
-    text   = (body.get("text") or "").strip()
-    target = body.get("target", "en")
-    if not text:
-        return {"translated": text}
-    tl = TRANSLATE_LANG_MAP.get(target, target)
-
-    # Primary: MyMemory free API (no key, 1000 words/day anonymous)
-    try:
-        url = (
-            "https://api.mymemory.translated.world/get"
-            f"?q={urllib.parse.quote(text)}&langpair=autodetect|{tl}"
-        )
-        req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
-        def _fetch():
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                return _json.loads(resp.read().decode())
-        data = await asyncio.to_thread(_fetch)
-        translated = (data.get("responseData") or {}).get("translatedText", "")
-        # MyMemory returns quota warning as translated text — ignore it
-        if translated and "MYMEMORY WARNING" not in translated and translated != text:
-            return {"translated": translated}
-    except Exception as e:
-        logging.warning(f"MyMemory translation failed: {e}")
-
-    # Fallback: LibreTranslate public instance
-    try:
-        lt_body = _json.dumps({"q": text, "source": "auto", "target": tl, "format": "text"}).encode()
-        lt_req  = urllib.request.Request(
-            "https://libretranslate.com/translate",
-            data=lt_body,
-            headers={"Content-Type": "application/json", "User-Agent": "PostApp/1.0"},
-            method="POST"
-        )
-        def _fetch_lt():
-            with urllib.request.urlopen(lt_req, timeout=6) as resp:
-                return _json.loads(resp.read().decode())
-        lt_data = await asyncio.to_thread(_fetch_lt)
-        translated = lt_data.get("translatedText", "")
-        if translated and translated != text:
-            return {"translated": translated}
-    except Exception as e:
-        logging.warning(f"LibreTranslate fallback failed: {e}")
-
-    # Final fallback: return original text unchanged
-    return {"translated": text}
 
 # ── Health ───────────────────────────────────────────────────
 @api.get("/")
