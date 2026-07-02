@@ -39,16 +39,22 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 logging.basicConfig(level=logging.INFO)
 
 def now(): return datetime.now(timezone.utc)
-async def hashpw(p):
-    return await asyncio.to_thread(lambda: bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode())
+async def _run_sync(fn):
+    """Run a sync function in the default thread pool (non-blocking)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fn)
+
+async def hashpw(p, rounds=10):
+    return await _run_sync(lambda: bcrypt.hashpw(p.encode(), bcrypt.gensalt(rounds=rounds)).decode())
 
 async def verifypw(p, h):
-    try: return await asyncio.to_thread(lambda: bcrypt.checkpw(p.encode(), h.encode()))
+    try: return await _run_sync(lambda: bcrypt.checkpw(p.encode(), h.encode()))
     except: return False
 
 async def run_in_bg(fn, *args):
     """Run a blocking IO/CPU function in thread pool (non-blocking for asyncio)."""
-    return await asyncio.to_thread(fn, *args)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fn, *args)
 def make_token(uid):
     return jwt.encode({"sub": uid, "exp": now() + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
 
@@ -423,8 +429,15 @@ async def verify_otp(p: OtpIn):
 @api.post("/auth/login")
 async def login(p: LoginIn):
     u = await db.users.find_one({"email": p.email})
-    if not u or not await verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid credentials")
+    if not u: raise HTTPException(400, "Invalid credentials")
+    pw_hash = u.get("password_hash", "")
+    ok = await verifypw(p.password, pw_hash)
+    if not ok: raise HTTPException(400, "Invalid credentials")
     if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
+    # Re-hash with rounds=10 if stored hash uses higher cost (silently upgrade)
+    if pw_hash and b"$2b$12$" in pw_hash.encode()[:10]:
+        new_hash = await hashpw(p.password, rounds=10)
+        asyncio.create_task(db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": new_hash}}))
     resp = {"token": make_token(u["id"]), "user_id": u["id"]}
     if u.get("deleted_at"):
         deleted_at = _aware(u["deleted_at"])
@@ -617,7 +630,11 @@ async def phone_signup(p: PhoneSignupIn):
 @api.post("/auth/phone-login")
 async def phone_login(p: PhoneLoginIn):
     u = await db.users.find_one({"phone": p.phone})
-    if not u or not await verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid phone or password")
+    pw_hash_p = u.get("password_hash", "") if u else ""
+    if not u or not await verifypw(p.password, pw_hash_p): raise HTTPException(400, "Invalid phone or password")
+    if u and pw_hash_p and b"$2b$12$" in pw_hash_p.encode()[:10]:
+        new_hash_p = await hashpw(p.password, rounds=10)
+        asyncio.create_task(db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": new_hash_p}}))
     if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
     resp = {"token": make_token(u["id"]), "user_id": u["id"]}
     if u.get("deleted_at"):
@@ -1571,7 +1588,7 @@ async def root():
         "status": "ok", 
         "demo_mode": DEMO_MODE, 
         "twilio": bool(TWILIO_SID),
-        "version": "2.0"
+        "version": "3.0"
     }
 
 # ── Add Secondary Contact (Anti-Fake-Account) ───────────────
@@ -1748,7 +1765,7 @@ async def root():
         "status": "ok", 
         "demo_mode": DEMO_MODE, 
         "twilio": bool(TWILIO_SID),
-        "version": "2.0"
+        "version": "3.0"
     }
 
 # ── Add Secondary Contact (Anti-Fake-Account) ───────────────
