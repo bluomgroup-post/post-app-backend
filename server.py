@@ -336,6 +336,7 @@ class ChangePasswordIn(BaseModel):
 
 class PostIn(BaseModel):
     content: str; accent: str = "#FFD600"; location: Optional[str] = None
+    photo_url: Optional[str] = None
 
 class CommentIn(BaseModel): 
     text: str
@@ -729,11 +730,13 @@ async def get_user(user_id: str, u=Depends(current_user)):
     if not user: raise HTTPException(404, "User not found")
     
     posts_count = await db.posts.count_documents({"user_id": user_id})
+    is_mutual = user_id in u.get("following", []) and u["id"] in (target.get("following") or [])
     followers_count = len(user.get("followers", []))
     following_count = len(user.get("following", []))
     
     return {
         **user,
+        "is_mutual": is_mutual,
         "stats": {
             "posts": posts_count,
             "followers": followers_count,
@@ -749,6 +752,7 @@ async def create_post(p: PostIn, u=Depends(current_user)):
         "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
         "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
         "content": p.content, "accent": p.accent, "location": p.location or "",
+        "photo_url": p.photo_url or None,
         "likes": [], "comments": [], "views": [], "created_at": now().isoformat(),
         "edited_at": None, "is_pinned": False
     }
@@ -807,17 +811,15 @@ async def delete_post(pid: str, u=Depends(current_user)):
 
 @api.patch("/posts/{pid}")
 async def edit_post(pid: str, p: PostIn, u=Depends(current_user)):
+    # Note: photo_url is also updated if provided
     """Edit post content"""
     post = await db.posts.find_one({"id": pid})
     if not post: raise HTTPException(404, "Post not found")
     if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
     
-    await db.posts.update_one({"id": pid}, {"$set": {
-        "content": p.content,
-        "accent": p.accent,
-        "location": p.location or "",
-        "edited_at": now().isoformat()
-    }})
+    upd = {"content": p.content, "accent": p.accent, "location": p.location or "", "edited_at": now().isoformat()}
+    if p.photo_url is not None: upd["photo_url"] = p.photo_url
+    await db.posts.update_one({"id": pid}, {"$set": upd})
     return await db.posts.find_one({"id": pid})
 
 @api.post("/posts/{pid}/like")
@@ -898,8 +900,10 @@ async def follow_user(user_id: str, u=Depends(current_user)):
     target = await db.users.find_one({"id": user_id})
     if not target: raise HTTPException(404, "User not found")
 
-    # Block if caller is blocked by target
+    # Block if either side blocked the other
     if u["id"] in target.get("blocked_users", []):
+        raise HTTPException(403, "Action not allowed")
+    if user_id in u.get("blocked_users", []):
         raise HTTPException(403, "Action not allowed")
 
     # Private account → create pending follow request instead of direct follow
@@ -1125,6 +1129,30 @@ async def list_friends(u=Depends(current_user)):
 # ── Messages ─────────────────────────────────────────────────
 @api.post("/messages")
 async def send_message(p: MessageIn, u=Depends(current_user)):
+    # Country-based chat rules:
+    # - Same continent → direct DM allowed (no connect needed)
+    # - Different continent → must be connected (friends)
+    # - Verified/badge accounts → no direct chat regardless
+    recipient = await db.users.find_one({"id": p.to_user_id})
+    if not recipient:
+        raise HTTPException(404, "Recipient not found")
+    
+    # Block check
+    if u["id"] in recipient.get("blocked_users", []) or p.to_user_id in u.get("blocked_users", []):
+        raise HTTPException(403, "Cannot message this user")
+    
+    # Verified badge accounts — no chat
+    if recipient.get("is_badge_verified"):
+        raise HTTPException(403, "Cannot message verified public figures")
+    
+    same_continent = (u.get("continent") or "").strip() == (recipient.get("continent") or "").strip() and u.get("continent")
+    is_connected = p.to_user_id in u.get("following", []) and u["id"] in recipient.get("following", [])
+    
+    if not same_continent:
+        # Different continent — must be connected (mutual follow)
+        if not is_connected:
+            raise HTTPException(403, "Connect with this user first to message across countries")
+    
     m = {
         "id": str(uuid.uuid4()), 
         "from_id": u["id"], 
