@@ -345,7 +345,14 @@ class LikeIn(BaseModel):
     color: Optional[str] = None
 
 class MessageIn(BaseModel):
-    to_user_id: str; text: str
+    to_user_id: str
+    text: str = ""
+    photo_url: Optional[str] = None
+    mood_color: Optional[str] = None
+
+class TypingIn(BaseModel):
+    to_user_id: str
+    is_typing: bool = True
 
 class FriendIn(BaseModel):
     target_user_id: str
@@ -1185,44 +1192,54 @@ async def list_friends(u=Depends(current_user)):
 
     return {"friends": friends, "pending_incoming": pending_in, "pending_outgoing": pending_out}
 
+# ── In-memory typing state ────────────────────────────────────
+_typing_state: dict = {}  # {from_id -> {to_id -> expires_at}}
+
 # ── Messages ─────────────────────────────────────────────────
 @api.post("/messages")
 async def send_message(p: MessageIn, u=Depends(current_user)):
-    # Country-based chat rules:
-    # - Same continent → direct DM allowed (no connect needed)
-    # - Different continent → must be connected (friends)
-    # - Verified/badge accounts → no direct chat regardless
+    if not p.text.strip() and not p.photo_url:
+        raise HTTPException(400, "Message cannot be empty")
     recipient = await db.users.find_one({"id": p.to_user_id})
     if not recipient:
         raise HTTPException(404, "Recipient not found")
-    
-    # Block check
     if u["id"] in recipient.get("blocked_users", []) or p.to_user_id in u.get("blocked_users", []):
         raise HTTPException(403, "Cannot message this user")
-    
-    # Verified badge accounts — no chat
     if recipient.get("is_badge_verified"):
         raise HTTPException(403, "Cannot message verified public figures")
-    
     same_continent = (u.get("continent") or "").strip() == (recipient.get("continent") or "").strip() and bool(u.get("continent"))
-    
     if not same_continent:
-        # Different continent — must be connected via friend/connect system
         fr = await db.friend_requests.find_one({
             "status": "accepted",
             "$or": [{"from_id": u["id"], "to_id": p.to_user_id}, {"from_id": p.to_user_id, "to_id": u["id"]}]
         })
         if not fr:
             raise HTTPException(403, "Connect with this user first to message across countries")
-    
+
+    # Segment 9: Timezone-aware silent delivery
+    # Check receiver's local hour using their timezone offset (if stored)
+    is_silent = False
+    recv_tz_offset = recipient.get("timezone_offset")  # hours offset, e.g. +5.5
+    if recv_tz_offset is not None:
+        try:
+            recv_hour = (now() + timedelta(hours=float(recv_tz_offset))).hour
+            is_silent = (recv_hour >= 23 or recv_hour < 6)
+        except Exception:
+            pass
+
     m = {
-        "id": str(uuid.uuid4()), 
-        "from_id": u["id"], 
-        "from_name": u["name"], 
-        "to_id": p.to_user_id, 
-        "text": p.text, 
+        "id": str(uuid.uuid4()),
+        "from_id": u["id"],
+        "from_name": u["name"],
+        "to_id": p.to_user_id,
+        "text": p.text,
+        "photo_url": p.photo_url,
+        "mood_color": p.mood_color,
         "created_at": now().isoformat(),
-        "read": False
+        "status": "sent",       # sent → delivered → seen
+        "deleted_for": [],      # list of user_ids who deleted for self
+        "deleted_for_everyone": False,
+        "is_silent": is_silent,
     }
     await db.messages.insert_one(m.copy())
     m.pop("_id", None)
@@ -1234,18 +1251,103 @@ async def list_messages(with_user: Optional[str] = None, skip: int = 0, limit: i
         q = {"$or": [{"from_id": u["id"], "to_id": with_user}, {"from_id": with_user, "to_id": u["id"]}]}
     else:
         q = {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]}
-    
     msgs = await db.messages.find(q, {"_id": 0}).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
     total = await db.messages.count_documents(q)
-    
-    # Mark as read
+    # Segment 2: Mark delivered when receiver fetches
     if with_user:
         await db.messages.update_many(
-            {"from_id": with_user, "to_id": u["id"], "read": False},
-            {"$set": {"read": True}}
+            {"from_id": with_user, "to_id": u["id"], "status": "sent"},
+            {"$set": {"status": "delivered"}}
         )
-    
+    # Filter out messages deleted for this user
+    msgs = [m for m in msgs if u["id"] not in m.get("deleted_for", []) and not m.get("deleted_for_everyone")]
     return {"messages": msgs, "total": total, "skip": skip, "limit": limit}
+
+@api.post("/messages/{msg_id}/seen")
+async def mark_message_seen(msg_id: str, u=Depends(current_user)):
+    """Segment 2: Mark a message as seen by the receiver"""
+    await db.messages.update_one(
+        {"id": msg_id, "to_id": u["id"]},
+        {"$set": {"status": "seen", "seen_at": now().isoformat()}}
+    )
+    return {"ok": True}
+
+@api.delete("/messages/{msg_id}")
+async def delete_message(msg_id: str, delete_for: str = "self", u=Depends(current_user)):
+    """Segment 4: Delete message for self or for everyone"""
+    msg = await db.messages.find_one({"id": msg_id})
+    if not msg: raise HTTPException(404, "Message not found")
+    if delete_for == "everyone":
+        if msg["from_id"] != u["id"]: raise HTTPException(403, "Only sender can delete for everyone")
+        await db.messages.update_one({"id": msg_id}, {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None}})
+    else:
+        await db.messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
+    return {"ok": True}
+
+@api.get("/messages/conversations")
+async def get_conversations(u=Depends(current_user)):
+    """Segment 5: Get chat list with last message preview and unread count"""
+    pipeline = [
+        {"$match": {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}], "deleted_for_everyone": {"$ne": True}}},
+        {"$sort": {"created_at": -1}},
+        {"$project": {
+            "_id": 0,
+            "other_id": {"$cond": [{"$eq": ["$from_id", u["id"]]}, "$to_id", "$from_id"]},
+            "text": 1, "photo_url": 1, "created_at": 1, "status": 1, "from_id": 1, "mood_color": 1
+        }},
+        {"$group": {
+            "_id": "$other_id",
+            "last_text": {"$first": "$text"},
+            "last_photo": {"$first": "$photo_url"},
+            "last_time": {"$first": "$created_at"},
+            "last_status": {"$first": "$status"},
+            "last_from": {"$first": "$from_id"},
+            "last_mood": {"$first": "$mood_color"},
+        }}
+    ]
+    convs = await db.messages.aggregate(pipeline).to_list(200)
+    user_ids = [c["_id"] for c in convs]
+    pub = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+           "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1,
+           "is_online": 1, "last_seen": 1}
+    users_list = await db.users.find({"id": {"$in": user_ids}}, pub).to_list(200)
+    users_map = {uu["id"]: uu for uu in users_list}
+    # Unread counts
+    for c in convs:
+        c["user"] = users_map.get(c["_id"], {})
+        c["unread"] = await db.messages.count_documents({
+            "from_id": c["_id"], "to_id": u["id"], "status": {"$ne": "seen"},
+            "deleted_for_everyone": {"$ne": True}
+        })
+    convs.sort(key=lambda x: x.get("last_time", ""), reverse=True)
+    return {"conversations": convs}
+
+@api.post("/messages/typing")
+async def set_typing(p: TypingIn, u=Depends(current_user)):
+    """Segment 3: Set typing indicator (stored in memory, expires in 5s)"""
+    if u["id"] not in _typing_state:
+        _typing_state[u["id"]] = {}
+    if p.is_typing:
+        _typing_state[u["id"]][p.to_user_id] = now() + timedelta(seconds=5)
+    else:
+        _typing_state[u["id"]].pop(p.to_user_id, None)
+    return {"ok": True}
+
+@api.get("/messages/typing")
+async def get_typing(with_user: str, u=Depends(current_user)):
+    """Segment 3: Check if a user is typing to me"""
+    expires = _typing_state.get(with_user, {}).get(u["id"])
+    if expires and now() < expires:
+        return {"is_typing": True}
+    return {"is_typing": False}
+
+@api.patch("/users/me/timezone")
+async def update_timezone(body: dict, u=Depends(current_user)):
+    """Segment 9: Store user's timezone offset for silent night delivery"""
+    offset = body.get("offset")
+    if offset is None: raise HTTPException(400, "offset required")
+    await db.users.update_one({"id": u["id"]}, {"$set": {"timezone_offset": float(offset)}})
+    return {"ok": True}
 
 # ── Notifications ────────────────────────────────────────────
 @api.get("/notifications")
@@ -1344,15 +1446,32 @@ TRANSLATE_LANG_MAP = {
     "ru": "ru", "bn": "bn", "id": "id", "tr": "tr",
 }
 
+# Segment 8: Cultural tone analysis — simple heuristic, no AI key needed
+def _detect_tone_hint(text: str) -> Optional[str]:
+    t = text.lower()
+    if any(w in t for w in ["please", "kindly", "would you", "could you", "sir", "ma'am", "madam", "dear"]):
+        return "Formal tone — polite phrasing used"
+    if any(w in t for w in ["hey", "yo", "sup", "lol", "haha", "bruh", "bro", "sis", "wanna", "gonna", "kinda"]):
+        return "Informal tone — casual/slang phrasing"
+    if any(w in t for w in ["urgent", "asap", "immediately", "now", "hurry", "quickly"]):
+        return "Urgent tone — time-sensitive message"
+    if text.endswith("?") or text.count("?") > 1:
+        return "Questioning tone — expecting a reply"
+    if any(w in t for w in ["sorry", "apolog", "forgive", "excuse me", "pardon"]):
+        return "Apologetic tone — expressing regret"
+    return None
+
 @api.post("/translate")
 async def translate_endpoint(body: dict):
     """POST App's own translation endpoint — uses MyMemory (free, no key needed)."""
     text   = (body.get("text") or "").strip()
     target = body.get("target", "en")
+    include_tone = body.get("tone", False)
     if not text:
-        return {"translated": text}
+        return {"translated": text, "tone_hint": None}
     tl = TRANSLATE_LANG_MAP.get(target, target)
 
+    translated = None
     # Primary: MyMemory free API (no key, 1000 words/day anonymous)
     try:
         url = (
@@ -1364,34 +1483,37 @@ async def translate_endpoint(body: dict):
             with urllib.request.urlopen(req, timeout=6) as resp:
                 return _json.loads(resp.read().decode())
         data = await asyncio.to_thread(_fetch)
-        translated = (data.get("responseData") or {}).get("translatedText", "")
-        # MyMemory returns quota warning as translated text — ignore it
-        if translated and "MYMEMORY WARNING" not in translated and translated != text:
-            return {"translated": translated}
+        t_result = (data.get("responseData") or {}).get("translatedText", "")
+        if t_result and "MYMEMORY WARNING" not in t_result and t_result != text:
+            translated = t_result
     except Exception as e:
         logging.warning(f"MyMemory translation failed: {e}")
 
-    # Fallback: LibreTranslate public instance
-    try:
-        lt_body = _json.dumps({"q": text, "source": "auto", "target": tl, "format": "text"}).encode()
-        lt_req  = urllib.request.Request(
-            "https://libretranslate.com/translate",
-            data=lt_body,
-            headers={"Content-Type": "application/json", "User-Agent": "PostApp/1.0"},
-            method="POST"
-        )
-        def _fetch_lt():
-            with urllib.request.urlopen(lt_req, timeout=6) as resp:
-                return _json.loads(resp.read().decode())
-        lt_data = await asyncio.to_thread(_fetch_lt)
-        translated = lt_data.get("translatedText", "")
-        if translated and translated != text:
-            return {"translated": translated}
-    except Exception as e:
-        logging.warning(f"LibreTranslate fallback failed: {e}")
+    if not translated:
+        # Fallback: LibreTranslate public instance
+        try:
+            lt_body = _json.dumps({"q": text, "source": "auto", "target": tl, "format": "text"}).encode()
+            lt_req  = urllib.request.Request(
+                "https://libretranslate.com/translate",
+                data=lt_body,
+                headers={"Content-Type": "application/json", "User-Agent": "PostApp/1.0"},
+                method="POST"
+            )
+            def _fetch_lt():
+                with urllib.request.urlopen(lt_req, timeout=6) as resp:
+                    return _json.loads(resp.read().decode())
+            lt_data = await asyncio.to_thread(_fetch_lt)
+            t_result = lt_data.get("translatedText", "")
+            if t_result and t_result != text:
+                translated = t_result
+        except Exception as e:
+            logging.warning(f"LibreTranslate fallback failed: {e}")
 
-    # Final fallback: return original text unchanged
-    return {"translated": text}
+    if not translated:
+        translated = text
+
+    tone_hint = _detect_tone_hint(text) if include_tone else None
+    return {"translated": translated, "tone_hint": tone_hint}
 
 # ── Health ───────────────────────────────────────────────────
 @api.get("/")
